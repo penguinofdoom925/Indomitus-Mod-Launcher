@@ -1,5 +1,5 @@
 @echo off
-rem GEM MeleeStance 0.6.10 build - Indomitus Launcher payload dll
+rem GEM MeleeStance build - Indomitus Launcher payload dll
 rem   build.bat          -> dist\gem_meleestance.dll + dist\gem_meleestance.ini
 rem   build.bat payload  -> the above, then copies both into ..\..\launcher\payload\
 rem   build.bat test     -> dist\ms_test.exe, run on the game / editor / server exe (offline finders + filter/charge cases)
