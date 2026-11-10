@@ -62,8 +62,8 @@ static void tp_unlock(const void *e) { for (int i = 0; i < TP_MAXLOCK; i++) if (
 /* named events                                                                         */
 /* ------------------------------------------------------------------------------------ */
 #ifndef FX_TEST
-static int g_evLogged;
-static void fire_named(void *entity, const char *name)
+static int g_evLogged, g_netEvents = 1, g_netLogged;
+static void fire_event(void *entity, const char *name, int net)
 {
     uint8_t *e = (uint8_t *)entity;
     if (!g_okEvents || !g_fireEvents || !e || !(e[ENT_FLAGS] & 2)) return;
@@ -74,11 +74,20 @@ static void fire_named(void *entity, const char *name)
     memset(ctx, 0, sizeof ctx);
     g_ctxCtor(ctx, entity);
     g_tagCtorCStr(tag, name);
+    if (net && g_netEvents && g_okNetEvents && g_isNetGame()) {          /* 0.2.12: the clients run it too (see find_net_effect) */
+        __attribute__((aligned(16))) uint8_t msg[0x400];
+        memset(msg, 0, sizeof msg);
+        void **m = (void **)g_makeNetEffect(msg, entity, tag);
+        if (m && *m) { ((void (*)(void *))(*(void ***)m)[1])(m); g_ctxDtor((uint8_t *)m + 0x10); }
+        if (g_verbose && g_netLogged < 40) { g_netLogged++; logf_("net event \"%s\" -> entity %p sent (set index %u)", name, entity, (unsigned)*(uint16_t *)(msg + 0x1A0)); }
+    }
     g_fireNamed(ctx, tag);
     g_tagDtor(tag);
     g_ctxDtor(ctx);
     if (g_verbose && g_evLogged < 100) { logf_("event \"%s\" -> entity %p", name, entity); if (++g_evLogged == 100) logf_("(further events not logged)"); }
 }
+static void fire_named(void *entity, const char *name) { fire_event(entity, name, 0); }   /* this machine only */
+static void fire_net(void *entity, const char *name)   { fire_event(entity, name, 1); }   /* + every client, in a network game */
 
 /* ------------------------------------------------------------------------------------ */
 /* the sub-order                                                                        */
@@ -170,7 +179,7 @@ static void tp_order_release(TpOrder *o, int fire)
     if (!o->active) return;
     o->active = 0;
     tp_unlock(o->entity);
-    if (fire) fire_named(o->entity, "teleport_end");
+    if (fire) fire_net(o->entity, "teleport_end");
 }
 /* eSingleOrder::Tick counts +0x24 down by the simulation quant while bit 20 is set, then calls Update(this, 1) */
 static void tp_order_wait(TpOrder *o, int32_t ms)
@@ -199,7 +208,7 @@ static int tp_order_update(TpOrder *o, int phase)
                                                      o->entity, p[0], p[1], p[2], o->pos[0], o->pos[1], o->pos[2], o->flightMs, o->arcH);
             tp_place(o->entity, o->start, o->hasRot ? o->rot : NULL, 0);     /* applies the new facing at once */
             o->diag = 6;
-            fire_named(o->entity, "teleport_takeoff");
+            fire_net(o->entity, "teleport_takeoff");
             o->state = 2;
             tp_order_wait(o, o->flightMs);                   /* tp_order_tick moves him along the arc meanwhile */
             return 0;
@@ -210,7 +219,7 @@ static int tp_order_update(TpOrder *o, int phase)
         float *p = (float *)(o->entity + ENT_POS);
         if (g_verbose && g_tpLogged < 50) logf_("teleport: unit %p (%.1f %.1f %.1f) -> (%.1f %.1f %.1f)", o->entity, p[0], p[1], p[2], o->pos[0], o->pos[1], o->pos[2]);
         tp_place(o->entity, o->pos, o->hasRot ? o->rot : NULL, 0);          /* lands facing the way he flew */
-        fire_named(o->entity, "teleport_jump");
+        fire_net(o->entity, "teleport_jump");
         o->state = 3;
         if (g_tpLogged < 50) g_tpLogged++;
         if (o->postMs > 0) { tp_order_wait(o, o->postMs); return 0; }
@@ -361,6 +370,8 @@ static int tp_has_tag(const uint8_t *entity, const char *name)
     return 0;
 }
 
+#include "watch.c"
+
 /* slot 3: execute(this, action, order, entity, target, flagF0) -> bool */
 static uint8_t tp_instr_execute(TpInstr *i, uint8_t *action, uint8_t *order, uint8_t *entity, uint8_t *target, uint8_t *f0)
 {
@@ -369,7 +380,7 @@ static uint8_t tp_instr_execute(TpInstr *i, uint8_t *action, uint8_t *order, uin
     if (*(int32_t *)(target + TGT_TYPE) != TGT_GROUND) { logf_("{teleport}: target is not a ground point (add {target ground} to the action) - action failed"); return 0; }
     if (g_cdTag[0] && tp_has_tag(entity, g_cdTag)) {         /* 0.2.10: on cooldown - tell the script, do nothing */
         if (g_verbose) logf_("{teleport}: unit %p has tag \"%s\" - on cooldown, action refused", entity, g_cdTag);
-        fire_named(entity, "teleport_cooldown");
+        fire_net(entity, "teleport_cooldown");
         return 0;
     }
     const float *tp = (const float *)(target + TGT_POS);
@@ -396,12 +407,13 @@ static uint8_t tp_instr_execute(TpInstr *i, uint8_t *action, uint8_t *order, uin
     o->arcH = arcM * *g_worldScale;
     o->magic = TP_MAGIC; o->active = 1;
     tp_lock(entity);
+    tp_quant_register(); watch_add(entity, "jump order");
     /* distance band first, so the script can pick the animation set before teleport_begin */
-    fire_named(entity, jumpM < i->bandMid ? "teleport_short" : jumpM < i->bandLong ? "teleport_mid" : "teleport_long");
+    fire_net(entity, jumpM < i->bandMid ? "teleport_short" : jumpM < i->bandLong ? "teleport_mid" : "teleport_long");
     if (g_verbose) logf_("{teleport}: unit %p click (%.1f %.1f %.1f) -> land (%.1f %.1f), %.1f units (limit %.1f), spread %.1f m, wait %d ms / %d ms",
                          entity, tp[0], tp[1], tp[2], o->pos[0], o->pos[1], d, lim, spreadM, o->preMs, o->postMs);
     g_setSubOrder(order, o);                                 /* finishes and deletes a previous sub-order, links ours */
-    fire_named(entity, "teleport_begin");
+    fire_net(entity, "teleport_begin");
     return 1;
 }
 
@@ -473,6 +485,7 @@ static void tp_quant(void)                                   /* once per simulat
 {
     g_engineTid = GetCurrentThreadId();
     if (g_aimEvents) tp_aim_scan();
+    watch_tick();
 }
 static void tp_quant_register(void)
 {
@@ -503,6 +516,7 @@ static void tp_aim(uint8_t *entity)
     }
     if (slot < 0) { if (spare < 0) return; slot = spare; g_aim[slot].active = 0; g_aim[slot].seen = now; g_aim[slot].entity = entity; }
     g_aim[slot].seen = now;                                  /* stamp only; tp_aim_scan (engine thread) fires the events */
+    watch_add(entity, "aimed");
 }
 
 static uint8_t hook_is_applicable(uint8_t *action, uint8_t *flag, uint8_t *entity, uint8_t *target)
@@ -596,6 +610,7 @@ static void install_hooks(void)
         g_okInvuln = n == g_nDamage;
         logf_("invulnerable while teleporting  %s (%d/%d damage classes)", g_okInvuln ? "ON" : "PARTIAL", n, g_nDamage);
     } else logf_("invulnerable while teleporting  off (ini)");
+    watch_install();
 }
 
 /* ------------------------------------------------------------------------------------ */

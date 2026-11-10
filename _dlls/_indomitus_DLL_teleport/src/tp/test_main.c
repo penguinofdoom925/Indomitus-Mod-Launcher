@@ -16,7 +16,7 @@ static int run_finders(TpFound *f)
     printf("--- core finders (required)\n");
     ok &= find_instr_registry(); ok &= find_read_float(); ok &= find_custom_action(); ok &= find_order_base(); ok &= find_set_pos(); ok &= find_world_scale();
     printf("--- feature finders\n");
-    ok &= find_fire_named(); ok &= find_give_order(); ok &= find_damage();
+    ok &= find_fire_named(); ok &= find_net_effect(); ok &= find_give_order(); ok &= find_damage();
     if (ok && !prologue_len((const uint8_t *)g_giveOrder)) { printf("GiveOrder prologue NOT relocatable\n"); ok = 0; }
     f->readFloat = (void *)g_rdFloat; f->give = (void *)g_giveOrder; f->setPos = (void *)g_setPos; f->setSub = (void *)g_setSubOrder;
     f->isap = g_vtCustomAction ? g_vtCustomAction[15] : NULL; f->dmg0 = (void *)g_damageExec[0]; f->beg = g_instrBegOff; f->nDmgExec = g_nDamageExec;

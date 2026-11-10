@@ -357,3 +357,32 @@ static int find_fire_named(void)
           EXE_OFF(fn[0]), EXE_OFF(fn[1]), EXE_OFF(fn[2]), EXE_OFF(fn[3]), EXE_OFF(fn[4]), g_entDefOff, g_defSetOff);
     return 1;
 }
+
+/* 0.2.12 network events. On a dedicated server the jump order runs on the server only, and FireNamed runs an event on
+   this machine only: the clients never played the jump (Alex's Nov 9 2026 3v3; the 0.2.11 watch log showed script tags
+   are NOT replicated, but the action's own {effect "jetpack_start"} did reach the client). The engine's {effect}
+   instruction (eInstruction_effect, vtable slot 3 = execute) does it like this:
+       Ctx(ctx, entity) ; if (IsNetGame()) { m = MakeNetEffect(buf, entity, &tag) ; m->vt[1](m) ; ~Ctx(buf + 0x10) }
+       FireNamed(ctx, &tag) ; ~Ctx(ctx)
+   MakeNetEffect looks the name up in the entity's interaction set and stores its index (0xFFFF = no such {on}); the
+   receiver runs that event itself. We take IsNetGame and MakeNetEffect from that function (calls 2 and 3; calls 1, 4,
+   5, 6 must be the Ctx / ~Ctx / FireNamed we already found, else the feature stays off). */
+typedef uint8_t (*IsNetGameFn)(void);
+typedef void   *(*MakeNetEffectFn)(void *buf, void *entity, const void *tag);
+static IsNetGameFn g_isNetGame; static MakeNetEffectFn g_makeNetEffect; static int g_okNetEvents;
+static int find_net_effect(void)
+{
+    if (!g_ctxCtor || !g_ctxDtor || !g_fireNamed) { logf_("net events: FireNamed not found, off"); return 0; }
+    void **vt = find_vtable_rtti(".?AUeInstruction_effect@Action@Interface@@");
+    if (!vt || !in_text(vt[3])) { logf_("net events: eInstruction_effect vtable not found, off"); return 0; }
+    uint8_t *p = (uint8_t *)vt[3], *site, *c[6];
+    for (int i = 0; i < 6; i++) { c[i] = next_call(p, 0x40, &site); if (!c[i]) { logf_("net events: effect execute not recognised (call %d), off", i + 1); return 0; } p = site + 5; }
+    if (c[0] != (uint8_t *)g_ctxCtor || c[3] != (uint8_t *)g_ctxDtor || c[4] != (uint8_t *)g_fireNamed || c[5] != (uint8_t *)g_ctxDtor) {
+        logf_("net events: effect execute has another shape (exe+0x%llX), off", EXE_OFF(vt[3])); return 0;
+    }
+    static const uint8_t ctx_at_10[] = { 0x48,0x8D,0x4E,0x10 };          /* lea rcx,[rsi+10h] ; call Ctx : the message holds a Ctx at +0x10 */
+    if (!find_bytes(c[2], 0x90, ctx_at_10, 4)) { logf_("net events: message layout not recognised (exe+0x%llX), off", EXE_OFF(c[2])); return 0; }
+    g_isNetGame = (IsNetGameFn)c[1]; g_makeNetEffect = (MakeNetEffectFn)c[2];
+    logf_("net events: effect execute exe+0x%llX, IsNetGame exe+0x%llX, MakeNetEffect exe+0x%llX", EXE_OFF(vt[3]), EXE_OFF(c[1]), EXE_OFF(c[2]));
+    return 1;
+}

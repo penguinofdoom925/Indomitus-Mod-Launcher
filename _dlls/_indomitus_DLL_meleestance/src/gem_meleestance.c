@@ -46,7 +46,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-#define MS_VERSION "0.7.30"
+#define MS_VERSION "0.7.32"
 #define MAXT 24
 #define TLEN 48
 
@@ -372,6 +372,15 @@ static int tag_stance(const uint8_t *ent) { return vec_has(ent + cfg_enttags, g_
  * that is brain+0x398 & 3 == 1 = "belongs to a human player", the PlayerUnits test. */
 typedef unsigned char (*ismanual_t)(const void *actor);
 static ismanual_t g_ismanual;
+/* 0.7.32: eActor::IsManualControlled reads [actor+0xDE0] and [actor+0xDD8] unchecked (see SIG_ISMANUAL). Alex's Nov 10 hosted game:
+ * the dedicated server died 26 min in (ACCESS_VIOLATION read at 0x18 in server exe+0x6549A0 <- IsManualControlled <- the dll) on a
+ * unit whose +0xDE0 was NULL (a human half torn down). A unit without both components is not under direct control. */
+static int ismanual_safe(const uint8_t *ent)
+{
+    if (!g_ismanual || !ent) return 0;
+    if (!*(const void *const *)(ent + 0xDE0) || !*(const void *const *)(ent + 0xDD8)) return 0;
+    return g_ismanual(ent) != 0;
+}
 static int cfg_manual_skip = 1;         /* [MeleeStance] SkipDirectControl */
 static uint32_t st_manual;
 /* 0.7.12 (Alex: in direct control "it takes my weapon away randomly in CQC" with 0.7.11): second test = the manual-control manager
@@ -417,7 +426,7 @@ static void manual_diag(const uint8_t *ent)
     unsigned long long v18 = (pde0 && readable(pde0 + 0x18, 8)) ? *(const unsigned long long *)(pde0 + 0x18) : 0;
     const uint8_t *dd8 = *(const uint8_t *const *)(ent + 0xDD8);
     int bit = (dd8 && readable(dd8 + 0x70, 4)) ? (int)((*(const uint32_t *)(dd8 + 0x70) >> 1) & 1) : 0;
-    int ism = g_ismanual ? g_ismanual(ent) != 0 : -1;
+    int ism = g_ismanual ? ismanual_safe(ent) : -1;
     const uint8_t *mo = g_mgr ? *g_mgr : NULL;
     const uint8_t *ma = (mo && readable(mo + 0x3B0, 8)) ? *(const uint8_t *const *)(mo + 0x3B0) : NULL;
     int code = (v18 != 0) | (bit << 1) | ((ism == 1) << 2) | ((ma == ent) << 3);
@@ -465,7 +474,7 @@ static int in_manual(const uint8_t *ent)
     }
     manual_diag(ent);                                                           /* 0.7.14 */
     if (!cfg_manual_skip) return 0;
-    int prop = g_ismanual ? g_ismanual(ent) != 0 : 0, mgr = mgr_actor_is(ent);
+    int prop = ismanual_safe(ent), mgr = mgr_actor_is(ent);
     if (!prop && !mgr) return 0;
     st_manual++;
     manual_log(ent, prop, mgr);
@@ -1224,13 +1233,14 @@ static const char *vt_name(void **vt)
     return nm;
 }
 
+static uint32_t g_poll_last;
 #define NKNOWN 256
 typedef struct { __attribute__((aligned(16))) uint8_t ref[REFSZ]; uint8_t *unit; uint32_t ms; int used; } known_t;
 static known_t g_known[NKNOWN];
 static int cfg_poll_on = 1;                /* [AutoDraw] OrderPoll */
 static uint32_t cfg_poll_ms = 250;         /* [AutoDraw] PollMs */
 static uint32_t cfg_blind_ms = 8000;       /* 0.7.19 [AutoDraw] BlindCheckMs: a draw tried without knowing is judged after this */
-static uint32_t g_poll_last, st_poll_fight, st_poll_draw, st_poll_unknown;
+static uint32_t st_poll_fight, st_poll_draw, st_poll_unknown;
 static int g_polllines, g_ovtlines;
 static void known_note(uint8_t *ent, uint32_t now)
 {
@@ -1352,6 +1362,7 @@ static void order_poll(const uint8_t *scanning, uint32_t now)
         if (!k->used) continue;
         uint8_t *v = (uint8_t *)ref_ent(k->ref);
         if (v != k->unit) { ref_free(k->ref); k->used = 0; continue; }          /* entity gone */
+        if (!readable(v, 0xDB0)) { k->used = 0; continue; }                     /* 0.7.31: freed with its scene (ref not cleared) */
         live[i] = v;
     }
     for (int i = 0; i < NKNOWN; i++) {
@@ -1889,11 +1900,29 @@ static int cfg_draw = 1, g_names_logged, g_dlines;
 /* 0.7.13: every log cap counted per game process; Alex's Nov 8 log spent all 200 charge + 200 held lines in the first mission and the
  * later ones (the "units aren't charging" test) left nothing. The caps now restart when the sim clock goes backwards (a new mission). */
 static uint32_t g_epoch_last;
+/* 0.7.31: every per-mission unit table is wiped when a new mission starts. Alex's Nov 9 3v3: the dedicated server crashed one
+ * second after "Exit game mode" (ACCESS_VIOLATION in order_poll's nearest-enemy loop, +0x5ce3 in 0.7.30): the battle scene is
+ * freed as a whole, the engine never clears our weak refs then (ref+8 stays 1), so 6 dead units were still "live" on the poll
+ * list. Plain memset, no ref_free: the refs' entities and ref lists went with the old scene. */
+static void mission_flush(void)
+{
+    memset(g_seen, 0, sizeof g_seen);
+    memset(g_unit, 0, sizeof g_unit);
+    memset(g_pend, 0, sizeof g_pend);
+    memset(g_last, 0, sizeof g_last);
+    memset(g_dpend, 0, sizeof g_dpend);
+    memset(g_known, 0, sizeof g_known);
+    memset(g_want, 0, sizeof g_want);
+    memset(g_mine, 0, sizeof g_mine);
+    memset(g_hostile, 0, sizeof g_hostile);
+    g_poll_last = 0;
+}
 static void log_epoch(uint32_t now)
 {
     if (g_epoch_last && now + 5000 < g_epoch_last) {
+        mission_flush();
         g_lines = g_clines = g_hlines = g_vlines = g_vreflines = g_adjlines = g_adlines = g_rclines = g_dlines = g_mlines = g_mdiag = g_seenlines = g_addiag = g_plines = g_skiplines = g_olines = g_rawlines = g_polllines = g_ovtlines = g_rblines = 0;
-        if (cfg_log) logf_("--- clock %u -> %u: new mission, log line caps reset", g_epoch_last, now);
+        if (cfg_log) logf_("--- clock %u -> %u: new mission, log line caps reset, unit tables cleared", g_epoch_last, now);
     }
     g_epoch_last = now;
 }
@@ -3201,6 +3230,10 @@ int main(int argc, char **argv)
         uint8_t ctx[0x20] = { 0 };
         *(void **)ctx = bolter.obj; *(void **)(ctx + 8) = dc.obj; *(void **)(ctx + 0x10) = ti3;
         g_ismanual = (ismanual_t)f_manual;
+        /* 0.7.32: a unit missing either component IsManualControlled reads is never asked (the engine function would fault) */
+        f_manual_v = 1; int m7 = !ismanual_safe(dc.obj);
+        static uint8_t fcomp[0x80]; *(void **)(dc.obj + 0xDE0) = fcomp; int m7b = !ismanual_safe(dc.obj);   /* only one of the two */
+        *(void **)(dc.obj + 0xDD8) = fcomp; int m7c = ismanual_safe(dc.obj) == 1;                                /* both: the engine is asked */
         f_manual_v = 0; *(void **)ctx = sword.obj; int m0 = ms_decide(ctx) == MELEE;                             /* carries melee (the filter only refuses guns of a unit seen with melee ammo) */
         f_manual_v = 1; *(void **)ctx = bolter.obj; int m1 = m0 && ms_decide(ctx) == PASS && st_manual == 1;
         *(void **)ctx = sword.obj; uint32_t q0 = st_charge_q; charge_note(ctx, 1, 1); int m2 = st_charge_q == q0;   /* no charge while driven */
@@ -3213,8 +3246,8 @@ int main(int argc, char **argv)
         *(void **)(fmgr + 0x3B0) = enemy.obj; int m6 = ms_decide(ctx) == REJECT;                              /* another unit driven -> dc back to normal */
         g_mgr = NULL;
         g_ismanual = NULL;
-        int ok = m1 && m2 && m2b && m3 && m4 && m5 && m5b && m6;
-        printf("direct control: guns pass %d no charge %d charge after %d normal %d disabled %d | manager: pass %d no charge %d other unit %d -> %s\n", m1, m2, m2b, m3, m4, m5, m5b, m6, ok ? "OK" : "FAIL");
+        int ok = m1 && m2 && m2b && m3 && m4 && m5 && m5b && m6 && m7 && m7b && m7c;
+        printf("direct control: guns pass %d no charge %d charge after %d normal %d disabled %d | manager: pass %d no charge %d other unit %d | missing component: none %d one %d both %d -> %s\n", m1, m2, m2b, m3, m4, m5, m5b, m6, m7, m7b, m7c, ok ? "OK" : "FAIL");
         if (!ok) fails++;
     }
     /* 0.7.1 reload cancel: idle inventory -> nothing; busy + heavy weapon in hand -> kept; busy + bolter -> cancelled */

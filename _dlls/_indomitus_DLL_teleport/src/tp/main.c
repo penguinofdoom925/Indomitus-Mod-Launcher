@@ -65,6 +65,8 @@ static void init(HMODULE self)
     g_defBandLong = ini_float("default_band_long", 28.0f);
     g_lift       = ini_int("lift", 1);
     g_aimEvents  = ini_int("aim_events", 1);
+    g_watchOn    = ini_int("watch", 1);
+    g_netEvents  = ini_int("net_events", 1);
     ini_str("cooldown_tag", "tp_cooldown", g_cdTag, sizeof g_cdTag);         /* 0.2.10; empty = no cooldown check */
     { char h[32]; ini_str("ent_tags", "0x4E8", h, sizeof h); unsigned long v = strtoul(h, NULL, 0); if (v >= 0x100 && v < 0x4000 && !(v & 7)) g_entTagsOff = (uint32_t)v; }
     logf_("cooldown: units tagged \"%s\" are refused with {on \"teleport_cooldown\"} (entity tags +0x%X)", g_cdTag[0] ? g_cdTag : "(off)", g_entTagsOff);
@@ -79,6 +81,7 @@ static void init(HMODULE self)
     g_okCore = find_instr_registry() && find_read_float() && find_custom_action() && find_order_base() && find_set_pos() && find_world_scale();
     if (!g_okCore) { logf_("{teleport} instruction         OFF (engine code not recognised)"); return; }
     g_okEvents = find_fire_named();
+    g_okNetEvents = g_okEvents && find_net_effect();
     if (!g_okEvents) logf_("teleport events                OFF (engine code not recognised)");
     else logf_("teleport events                %s (teleport_begin / teleport_jump / teleport_end)", g_fireEvents ? "ON" : "off (ini)");
     if (g_wantLock && !find_give_order()) g_wantLock = 0;
