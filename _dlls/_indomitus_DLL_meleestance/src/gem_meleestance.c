@@ -46,7 +46,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-#define MS_VERSION "0.7.13"
+#define MS_VERSION "0.7.30"
 #define MAXT 24
 #define TLEN 48
 
@@ -184,6 +184,10 @@ static uint8_t *g_scan_lo, *g_scan_hi;     /* the enemy scan (return-address win
 static char g_tagl[2][TLEN], g_ctagl[1][TLEN];
 static int  n_tagl = 1;
 static uint32_t st_reject, st_allow, st_charge_q, st_charge_go, st_charge_drop;
+/* 0.7.21 heartbeat (Alex's 0.7.20 session: hook in place, checked in the live process, yet the dll tracked no unit and logged
+ * nothing from a fight): how often the engine calls the hook at all. A background thread only reads these and writes the log
+ * (no engine calls) every 5 s while they change, so a silent log now says whether the engine asked anything. */
+static volatile LONG st_hk_all, st_hk_scan, st_hk_human, st_hk_enemy, st_hk_polls;
 
 enum { PASS = 0, REJECT = 1, MELEE = 2 };
 
@@ -205,6 +209,7 @@ static void melee_seen(const void *u)
     }
     slot->unit = u; slot->ms = now;
 }
+static int g_seenlines, g_addiag;   /* 0.7.15 auto-draw diagnostic line caps (per mission) */
 static int carries_melee(const void *u)
 {
     if (!g_clock) return 1;                                  /* no clock found: old behaviour (always enforce) */
@@ -232,6 +237,21 @@ static int is_linked(const uint8_t *ent) { return cfg_skip_linked && ((*(const u
 static int   cfg_ad_on = 1, cfg_ad_player = 1;
 static float cfg_ad_dist = 100.0f;
 static uint32_t cfg_ad_hold = 3000;
+/* 0.7.16 probe (Alex's Nov 8 dump: the engine never offered a belt melee weapon while a gun was in hand - the ammo.set gun rows
+ * win before the melee rows are reached - so carries_melee never became true and the auto-draw never armed): an enemy inside
+ * Distance and no melee seen on the unit -> its gun ammo is refused for one weapon pick (ProbeMs) so the engine falls through to
+ * the melee rows. Melee offered = armed (normal auto-draw); only guns offered = no melee weapon, guns kept for NoMeleeMs. */
+static int cfg_probe_on = 1;
+static int cfg_probe_any = 1;      /* 0.7.18 [AutoDraw] ProbeAnyRange: probe on the first scanned enemy at any range (the order poll needs the answer before fight range) */
+static uint32_t cfg_probe_ms = 300, cfg_probe_cd = 4000, cfg_nomelee_ms = 20000;   /* 0.7.25: 20 s (Alex) */
+static uint32_t st_probe, st_probe_ok, st_probe_fail, st_probe_rej;
+static int g_plines;
+/* 0.7.16 fight order (Alex: "when units are in fight range they should be forced to their melee weapon and use the fight order"):
+ * inside [AutoDraw] Distance a melee unit gets the attack_melee order (eFight) on the enemy, even in reach (before: no order in
+ * reach / under MinDistance, the engine's own blows = punches with the gun in hand). Once per enemy while eFight runs on it. */
+static int cfg_fight_on = 1;
+static uint32_t cfg_fight_cd = 1500;
+static uint32_t st_fight_q;
 static int   cfg_veh_on = 1;
 static char  cfg_vtags[MAXT][TLEN] = { "melee_light", "melee_heavy" };
 static int   n_vtags = 2;
@@ -273,6 +293,22 @@ typedef struct {
     uint32_t ad_draw_ms;      /* last auto take-item order */
     int auto_drawn;           /* the melee weapon came out through the auto-draw (limits the charge) */
     uint32_t manual_ms;       /* 0.7.12: last "under direct control" log line for this unit */
+    uint32_t diag_ms;         /* 0.7.14: last direct-control diagnostic look at this unit (keeps the slot alive) */
+    int diag_seen, diag_code; /* 0.7.14: last logged flag state (bit0 prop DE0, bit1 DD8 bit, bit2 IsManualControlled, bit3 manager actor) */
+    int ad_diag;              /* 0.7.15: last logged auto-draw state + 1 (0 = none yet) */
+    uint32_t probe_ms;        /* 0.7.16: probe running since (0 = none) */
+    uint32_t probe_last;      /* 0.7.16: last probe start (ProbeCooldownMs) */
+    uint32_t nomelee_until;   /* 0.7.16: probe found no melee weapon: no new probe before this */
+    int probe_rej;            /* 0.7.16: guns refused during the running probe */
+    uint32_t melee_until;     /* 0.7.18: melee ammo was offered for this unit: it carries a melee weapon until then (KnownMs) */
+    uint32_t poll_ms;         /* 0.7.18: last order-poll log line for this unit */
+    uint32_t blind_ms;        /* 0.7.19: the poll drew without knowing (no probe / button answer): checked after BlindCheckMs */
+    const void *ovt;          /* 0.7.20: front order vtable last logged by the poll */
+    uint32_t touch;           /* 0.7.26: last use of this slot (staleness; see unit_of) */
+    char gun[72];             /* 0.7.26: name words of the weapon in hand when the dll drew the melee weapon (drawn again when no enemy is in fight range) */
+    uint32_t gun_ms;          /* 0.7.26: last ranged re-draw order */
+    int blind_ord;            /* 0.7.26: the blind draw replaced an attack order on that enemy (given back if no melee weapon shows) */
+    uint32_t fr_ms;           /* 0.7.24: last poll that found an enemy in fight range (or the unit fighting) */
 } unit_t;
 #define NUNIT 512
 static unit_t g_unit[NUNIT];
@@ -282,17 +318,43 @@ static unit_t *unit_of(const void *u, int make)
     unit_t *old = NULL;
     for (int i = 0; i < 16; i++) {
         unit_t *s = &g_unit[(h + i) % NUNIT];
-        if (s->unit == u) return s;
-        if (!old) {
-            uint32_t last = s->inf_ms > s->ad_until ? s->inf_ms : s->ad_until;
-            if (!s->unit || (uint32_t)(now - last) > 60000) old = s;
-        }
+        if (s->unit == u) { s->touch = now ? now : 1; return s; }
+        /* 0.7.26: a slot is stale 60 s after its last USE. Before, staleness was the newest of inf_ms / ad_until / diag_ms /
+         * probe_last: a unit that only had the newer fields set (fr_ms, ad_draw_ms, melee_until, gun) looked stale as soon as the
+         * clock passed 60 s, and ad_until (a future time) made the difference wrap. Any other unit hashing nearby then took the
+         * slot: Alex's 0.7.25 log after the first minute - draw cooldown, fight-range mark and auto_drawn all forgotten. */
+        if (!old && (!s->unit || (uint32_t)(now - s->touch) > 60000)) old = s;
     }
     if (!make) return NULL;
     if (!old) old = &g_unit[h];
     memset(old, 0, sizeof *old);
-    old->unit = u;
+    old->unit = u; old->touch = now ? now : 1;
     return old;
+}
+/* 0.7.18: carries a melee weapon - offered in the last 20 s, or found (by the probe or any melee offer) within KnownMs. The 20 s
+ * window alone forgot a unit's knife between fights, and the engine only offers it when no gun row wins, so most units were
+ * "unknown" exactly when it mattered (Alex's attack-order test). */
+static uint32_t cfg_known_ms = 300000;     /* [AutoDraw] KnownMs */
+static int melee_by_button(const void *u);   /* 0.7.19: the melee_toggle button's own "unit carries a melee item" test (below) */
+static void melee_known(const void *u)
+{
+    unit_t *s = unit_of(u, 1);
+    s->melee_until = now_ms() + cfg_known_ms; if (!s->melee_until) s->melee_until = 1;
+    s->nomelee_until = 0;
+}
+static int has_melee(const void *u)
+{
+    if (carries_melee(u)) return 1;
+    uint32_t now = now_ms();
+    unit_t *s = unit_of(u, 0);
+    if (s && s->melee_until && (int32_t)(s->melee_until - now) > 0) return 1;
+    if (s && s->nomelee_until && (int32_t)(s->nomelee_until - now) > 0) return 0;
+    /* 0.7.19 (Alex: "if the melee stance button can force the switch, why not run that in fight range?"): ask the button. Its
+     * CanApply is what shows it for a unit ({item "melee"} {item_in_box}); cached like the probe's answer. */
+    int b = melee_by_button(u);
+    if (b == 1) { melee_known(u); return 1; }
+    if (b == 0) { s = unit_of(u, 1); s->nomelee_until = now + cfg_nomelee_ms; if (!s->nomelee_until) s->nomelee_until = 1; }
+    return 0;
 }
 static int auto_active(const void *u)
 {
@@ -327,9 +389,82 @@ static void manual_log(const uint8_t *ent, int prop, int mgr)
     s->manual_ms = now ? now : 1; g_mlines++;
     logf_("manual: [%u ms] unit %p under direct control (property %d, manager %d): stance filter / charge / auto-draw / reload cancel skipped (skips %u)", now, (const void *)ent, prop, mgr, st_manual);
 }
+/* 0.7.14 diagnostic (Alex, Nov 8 2026: after leaving direct control the unit still "acted like I was in it"; the 0.7.13 log only ever
+ * showed "property 1, manager 0", even while driving): for every unit owned by a human player, log each change of the four inputs
+ * separately - the DE0 property value (+0x18), the DD8 +0x70 bit 1 (the two halves of IsManualControlled), IsManualControlled itself,
+ * and whether the manager's +0x3B0 is this unit. When IsManualControlled is on but the manager does not name the unit, the manager
+ * object's first 0x1000 bytes are searched for the unit pointer (to find the right offset). [MeleeStance] DiagManual, 300 lines/mission. */
+static int cfg_manual_diag = 1;
+static int g_mdiag;
+static int readable(const void *p, size_t n)
+{
+    const uint8_t *a = (const uint8_t *)p;
+    while (n) {
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(a, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !mi.Protect) return 0;
+        size_t left = (size_t)((const uint8_t *)mi.BaseAddress + mi.RegionSize - a);
+        if (left >= n) return 1;
+        a += left; n -= left;
+    }
+    return 1;
+}
+static void manual_diag(const uint8_t *ent)
+{
+    if (!cfg_log || !cfg_manual_diag) return;
+    const uint8_t *br = *(const uint8_t *const *)(ent + 0xDC8);
+    if (!br || !readable(br + 0x398, 1) || (br[0x398] & 3) != 1) return;        /* human player's units only */
+    const uint8_t *pde0 = *(const uint8_t *const *)(ent + 0xDE0);
+    unsigned long long v18 = (pde0 && readable(pde0 + 0x18, 8)) ? *(const unsigned long long *)(pde0 + 0x18) : 0;
+    const uint8_t *dd8 = *(const uint8_t *const *)(ent + 0xDD8);
+    int bit = (dd8 && readable(dd8 + 0x70, 4)) ? (int)((*(const uint32_t *)(dd8 + 0x70) >> 1) & 1) : 0;
+    int ism = g_ismanual ? g_ismanual(ent) != 0 : -1;
+    const uint8_t *mo = g_mgr ? *g_mgr : NULL;
+    const uint8_t *ma = (mo && readable(mo + 0x3B0, 8)) ? *(const uint8_t *const *)(mo + 0x3B0) : NULL;
+    int code = (v18 != 0) | (bit << 1) | ((ism == 1) << 2) | ((ma == ent) << 3);
+    unit_t *s = unit_of(ent, 1);
+    uint32_t now = now_ms();
+    s->diag_ms = now ? now : 1;
+    int first = !s->diag_seen, prev = s->diag_code;
+    if (!first && prev == code) return;
+    s->diag_seen = 1; s->diag_code = code;
+    if (first && !code) return;                                                 /* plain unit, never manual: nothing to say */
+    if (g_mdiag >= 300) return;
+    g_mdiag++;
+    logf_("mdiag: [%u ms] unit %p state %d -> %d: prop DE0(+18)=%llX, DD8+70 bit1=%d, IsManualControlled=%d | manager %p, +3B0=%p%s",
+          now, (const void *)ent, first ? -1 : prev, code, v18, bit, ism, (const void *)mo, (const void *)ma, ma == ent ? " (THIS unit)" : "");
+    if (mo && (code & 4) && !(code & 8) && readable(mo, 0x1000)) {
+        char b[256]; int n = 0, hits = 0;
+        for (int off = 0; off < 0x1000 && hits < 8; off += 8)
+            if (*(const uint8_t *const *)(mo + off) == ent) { n += snprintf(b + n, sizeof b - n, " +0x%X", off); hits++; }
+        if (hits) logf_("mdiag:   unit pointer found in the manager at%s", b);
+        else logf_("mdiag:   unit pointer not in the manager's first 0x1000 bytes");
+    }
+}
+/* 0.7.17 (jetpack session, Nov 9 2026): units another dll is driving carry a script tag (teleport: `tp_jetpack` from jetpack_start
+ * to teleport_end, while its GiveOrder lock refuses every order) - left alone like direct control. [MeleeStance] SkipTags */
+/* 0.7.28 (Alex): also `hidden` and `melee_disabled` - script tags that switch the dll off for a unit */
+static char cfg_skiptags[8][TLEN] = { "tp_jetpack", "hidden", "melee_disabled", "disable_melee", "valkyrie", "sensor_off" };
+static int n_skiptags = 6, g_skiplines;
+/* 0.7.28 (Alex): the same units are no targets for the dll either, and neither are call-ins: every Valkyrie carries `valkyrie`
+ * (airborne_main.inc), every dormant call-in / spawner `sensor_off` (40k_spawners). A weapon pick against such a target goes
+ * straight to the engine (no stance filter, no charge, no auto-draw), and the fight-range poll does not see it as an enemy.
+ * tp_jetpack is not in this list: a jumping marine is still an enemy. [MeleeStance] IgnoreTargetTags */
+static char cfg_tgttags[8][TLEN] = { "hidden", "melee_disabled", "valkyrie", "sensor_off" };
+static int n_tgttags = 4;
+static volatile LONG st_tgt_ignored;
+static int ignored_target(const uint8_t *t)
+{
+    return t && n_tgttags && vec_has(t + cfg_enttags, cfg_tgttags, n_tgttags) == 1;
+}
 static int in_manual(const uint8_t *ent)
 {
-    if (!cfg_manual_skip || !ent || !(ent[0x30] & 0x02)) return 0;
+    if (!ent || !(ent[0x30] & 0x02)) return 0;
+    if (n_skiptags && vec_has(ent + cfg_enttags, cfg_skiptags, n_skiptags) == 1) {
+        if (cfg_log && g_skiplines < 20) { g_skiplines++; logf_("skip: [%u ms] unit %p carries a SkipTags tag: left alone", now_ms(), (const void *)ent); }
+        return 1;
+    }
+    manual_diag(ent);                                                           /* 0.7.14 */
+    if (!cfg_manual_skip) return 0;
     int prop = g_ismanual ? g_ismanual(ent) != 0 : 0, mgr = mgr_actor_is(ent);
     if (!prop && !mgr) return 0;
     st_manual++;
@@ -374,12 +509,57 @@ static const uint8_t *order_target(const uint8_t *ent, int own)
     return *(const uint8_t *const *)(o + 0x58);
 }
 static const uint8_t *explicit_target(const uint8_t *ent) { return order_target(ent, 0); }
+/* 0.7.16: the unit is running the melee order (eFight) on this enemy right now */
+static int fight_running(const uint8_t *ent, const uint8_t *tgt)
+{
+    if (!g_vt_fight) return 0;
+    const uint8_t *o = (const uint8_t *)front_order(ent);
+    if (!o || *(void **const *)o != g_vt_fight) return 0;
+    return *(const uint32_t *)(o + 0x48) == 1 && *(const uint8_t *const *)(o + 0x58) == tgt;
+}
 static int veh_ordered(const uint8_t *u, const uint8_t *tgt)
 {
     const uint8_t *t = explicit_target(u);
     int r = t && t == tgt;
     if (r && cfg_log && g_vlines < 20) { g_vlines++; logf_("vehicles: unit %p was ordered onto vehicle %p, melee allowed, no retarget", (const void *)u, (const void *)tgt); }
     return r;
+}
+
+/* 0.7.29 zerg (Alex: replaces the melee_inf_atk mission triggers - "charge from 80m, I don't want the lua logic getting them
+ * pinned down, they should zerg in"). The triggers took every human with a melee weapon in hand (`melee_capable`) and a located
+ * enemy human within 74 m, dropped its orders and gave it an attack order. Here: an AI-owned human (not a human player's unit:
+ * his switch is the melee toggle) that HOLDS its melee weapon, not one the dll's fight-range draw put in its hand, counts as in
+ * melee stance against an enemy human within [Zerg] Distance: guns refused, run, then the fight order (the stance charge), and
+ * the charge order is given again whenever something else (the bot's Lua squad orders) replaced it. */
+static int cfg_zerg_on = 1;                /* [Zerg] Enabled */
+static float cfg_zerg_dist = 1600.0f;      /* [Zerg] Distance (20 units = 1 m) */
+static uint32_t cfg_zerg_reorder = 700;    /* [Zerg] ReorderMs: how soon a replaced charge order is given again */
+static char cfg_zerg_tag[1][TLEN] = { "melee_infantry" };   /* [Zerg] Tag (empty = any AI unit holding melee, the 0.7.29 rule) */
+static volatile LONG st_zerg, st_zerg_reorder;
+static int g_zlines;
+static int zerg_unit(const uint8_t *ent, const uint8_t *ti)
+{
+    if (!cfg_zerg_on || !ent || !ti || !(ent[0x30] & 0x04)) return 0;
+    const uint8_t *tg = *(const uint8_t *const *)(ti + 0x18);
+    if (!tg || tg == ent || !(tg[0x30] & 0x04) || tg[0xDA8] == ent[0xDA8] || linked_raw(tg)) return 0;
+    if (vec_has(ent + cfg_enttags, g_ctagl, 1) != 1) return 0;                   /* melee weapon in hand */
+    /* 0.7.30 (Alex: "this will take over the units that pull swords out in combat"): only units carrying the breed tag
+     * (melee-only breeds: `melee_infantry`, copied onto the entity by BreedTags) */
+    if (cfg_zerg_tag[0][0] && vec_has(ent + cfg_enttags, cfg_zerg_tag, 1) != 1) return 0;
+    const uint8_t *br = *(const uint8_t *const *)(ent + 0xDC8);
+    if (!br || (br[0x398] & 3) == 1) return 0;                                  /* a human player's unit */
+    unit_t *us = unit_of(ent, 0);
+    if (us && us->auto_drawn) return 0;                                         /* the dll drew it for a close fight: gun comes back */
+    float dx = *(const float *)(ent + 0x74) - *(const float *)(ti + 0x28);
+    float dy = *(const float *)(ent + 0x78) - *(const float *)(ti + 0x2C);
+    return dx * dx + dy * dy <= cfg_zerg_dist * cfg_zerg_dist;
+}
+static int front_is_mine(const uint8_t *ent)
+{
+    const void *o = front_order(ent);
+    if (!o) return 0;
+    for (int i = 0; i < NMINE; i++) if (g_mine[i] == o) return 1;
+    return 0;
 }
 
 /* what to do with this candidate: PASS (vanilla), REJECT (not melee, unit in stance), MELEE (melee ammo, unit in stance) */
@@ -394,8 +574,21 @@ static int ms_decide(const uint8_t *ctx)
     if (is_linked(ent)) return PASS;                                            /* crew/passenger */
     int m = vec_has(ammo + cfg_ammotags + TAGS_VEC, cfg_mtags, n_mtags);
     if (m < 0) return PASS;
-    if (m) melee_seen(ent);                                                     /* any human: carried-melee record (auto-draw) */
+    if (m) {
+        if (cfg_log && g_seenlines < 60 && !carries_melee(ent)) {                /* 0.7.15: first melee offer per unit (auto-draw arms on it) */
+            g_seenlines++;
+            char nm[200]; vec_str(ammo + cfg_namtags + TAGS_VEC, nm, sizeof nm);
+            logf_("seen: [%u ms] unit %p offered melee ammo \"%s\" (stance %d): auto-draw armed for %d ms", now_ms(), (const void *)ent, nm, tag_stance(ent), SEEN_MS);
+        }
+        melee_seen(ent);                                                        /* any human: carried-melee record (auto-draw) */
+        melee_known(ent);                                                       /* 0.7.18: long memory */
+    }
     int ts = tag_stance(ent);
+    if (!ts && zerg_unit(ent, *(const uint8_t *const *)(ctx + 0x10))) {         /* 0.7.29: AI melee holder, enemy human within 80 m */
+        st_zerg++;
+        if (cfg_log && g_zlines < 40) { g_zlines++; logf_("zerg: [%u ms] unit %p holds melee, enemy %p within %.0f: treated as melee stance (picks %ld)", now_ms(), (const void *)ent, *(void *const *)(*(const uint8_t *const *)(ctx + 0x10) + 0x18), cfg_zerg_dist, (long)st_zerg); }
+        return m ? MELEE : REJECT;
+    }
     if (cfg_veh_on && m) {                                                      /* hand melee against a vehicle */
         const uint8_t *ti = *(const uint8_t *const *)(ctx + 0x10);
         const uint8_t *tg = ti ? *(const uint8_t *const *)(ti + 0x18) : NULL;
@@ -412,9 +605,33 @@ static int ms_decide(const uint8_t *ctx)
             return MELEE;
         }
     }
+    if (!ts && !auto_active(ent) && cfg_probe_on) {                             /* 0.7.16 probe running: guns refused for this pick */
+        unit_t *ps = unit_of(ent, 0);
+        uint32_t pnow = now_ms();
+        if (ps && ps->probe_ms && (uint32_t)(pnow - ps->probe_ms) < cfg_probe_ms * 4) {
+            if (m) {
+                ps->probe_ms = 0; ps->nomelee_until = 0; st_probe_ok++;
+                if (cfg_log && g_plines < 60) {
+                    g_plines++;
+                    char nm[200]; vec_str(ammo + cfg_namtags + TAGS_VEC, nm, sizeof nm);
+                    logf_("probe: [%u ms] unit %p melee found (\"%s\", %d guns refused): auto-draw armed (found %u, none %u)", pnow, (const void *)ent, nm, ps->probe_rej, st_probe_ok, st_probe_fail);
+                }
+                /* 0.7.18: a far probe only learns the answer - taking the melee pick at 50 m would swap the weapon twice */
+                const uint8_t *pti = *(const uint8_t *const *)(ctx + 0x10);
+                if (pti) {
+                    float dx = *(const float *)(ent + 0x74) - *(const float *)(pti + 0x28);
+                    float dy = *(const float *)(ent + 0x78) - *(const float *)(pti + 0x2C);
+                    if (dx * dx + dy * dy > cfg_ad_dist * cfg_ad_dist) return REJECT;
+                }
+                return MELEE;
+            }
+            ps->probe_rej++; st_probe_rej++;
+            return REJECT;
+        }
+    }
     if (!ts && !auto_active(ent)) return PASS;                                  /* not in melee stance (toggle / always tag / auto-draw hold) */
     if (m) return MELEE;
-    return carries_melee(ent) ? REJECT : PASS;              /* no melee weapon seen on him: keep his guns */
+    return has_melee(ent) ? REJECT : PASS;                  /* no melee weapon seen on him: keep his guns (0.7.18: long memory) */
 }
 
 /* ---------------------------------------------------------------- charge */
@@ -425,6 +642,7 @@ typedef struct {
     uint8_t *unit, *tgt;
     float dist;
     uint32_t clock;
+    int ff;                 /* 0.7.24: fight order even when the melee weapon is not in hand */
     int used, veh, stalled; /* veh: target is a vehicle (0.7); stalled: re-order after a stall (0.7.8: vs a vehicle = attack order, no second run) */
 } pend_t;
 #define NPEND 64
@@ -436,6 +654,7 @@ typedef struct {
     int phase; float ox, oy;                 /* phase: 1 = move order running at the enemy (ox/oy = its position then), 2 = attack order */
     float ux, uy; int stalls;                /* 0.7.1: the unit's own position at the last stall sample, stalled samples in a row */
     uint32_t vchk_ms, adj_until; float vux, vuy; const void *adj_tgt;   /* 0.7.3: hull-contact sample vs a vehicle, and the "pressed against it" window */
+    const void *otgt; int ogo;               /* 0.7.17: last logged order-path pick (enemy, decision + 1) */
     __attribute__((aligned(16))) uint8_t tref[REFSZ];
 } last_t;
 static float cfg_close = 150.0f;         /* [Charge] CloseDistance: inside it the attack order, outside a move order to the enemy */
@@ -483,6 +702,7 @@ static void last_reset(last_t *l, const void *unit)
     if (l->has_ref) ref_free(l->tref);
     l->unit = unit; l->tgt = NULL; l->ms = 0; l->draw_ms = 0; l->chk_ms = 0; l->lastd = 0; l->has_ref = 0; l->held = 0;
     l->phase = 0; l->ox = l->oy = 0; l->ux = l->uy = 0; l->stalls = 0;
+    l->otgt = NULL; l->ogo = 0;                                                     /* 0.7.17 */
     l->vchk_ms = 0; l->adj_until = 0; l->vux = l->vuy = 0; l->adj_tgt = NULL;
 }
 static last_t *last_of(const void *unit, int make)
@@ -543,7 +763,7 @@ static void charge_flush(const uint8_t *scanning)
             void *ok;
             const char *kind;
             int phase = 0;
-            if (noweap && g_draw_action) {                    /* draw the melee weapon first (take-item order); next charge = move/attack */
+            if (noweap && g_draw_action && !p->ff) {                    /* draw the melee weapon first (take-item order); next charge = move/attack */
                 int issued = draw_melee(g_draw_action, *(void ***)g_draw_action, p->unit);
                 ok = (void *)1; kind = issued ? "draw" : "draw-wait"; mv = 0;   /* draw-wait: a take-item order is still running (DrawCooldownMs) */
             } else {
@@ -555,7 +775,7 @@ static void charge_flush(const uint8_t *scanning)
                      * uses MakeMove = Order::eMoveTask (the AI's run order) instead, so that is the far charge now. */
                     if (g_mvchange && cfg_runmode >= 0) {
                         void *mc = g_mvchange(-1, cfg_runmode, 0);
-                        if (mc) g_addorder(p->unit, mc, params);
+                        if (mc && g_addorder(p->unit, mc, params)) mine_add(mc);   /* 0.7.29: ours too (zerg re-order test) */
                     }
                     order = g_mkmove ? g_mkmove(xy, 0) : g_uimove(xy, 1);
                     if (order) *(uint16_t *)((uint8_t *)order + 0x18) = 4;   /* as Action::e_move does on every click move */
@@ -582,6 +802,28 @@ static void charge_flush(const uint8_t *scanning)
         ref_free(p->uref); ref_free(p->tref);
         p->used = 0;
     }
+}
+
+static int g_pend_ff;
+/* queue a charge / fight order for a later tick (0.7.18: shared by charge_note and the order poll) */
+static void pend_push(uint8_t *ent, uint8_t *tgt, float d, int veh, int stalled, uint32_t now)
+{
+    pend_t *free_ = NULL;
+    for (int i = 0; i < NPEND; i++) {
+        pend_t *p = &g_pend[i];
+        if (p->used && p->unit == ent) {
+            if (veh && !p->veh) return;                       /* infantry already queued: it wins */
+            if (veh == p->veh && d >= p->dist) return;        /* already queued a nearer enemy */
+            ref_free(p->tref); ref_make(p->tref, tgt);
+            p->tgt = tgt; p->dist = d; p->clock = now; p->veh = veh; p->stalled = stalled; p->ff = g_pend_ff;
+            return;
+        }
+        if (!p->used && !free_) free_ = p;
+    }
+    if (!free_) return;
+    ref_make(free_->uref, ent); ref_make(free_->tref, tgt);
+    free_->unit = ent; free_->tgt = tgt; free_->dist = d; free_->clock = now; free_->used = 1; free_->veh = veh; free_->stalled = stalled; free_->ff = g_pend_ff;
+    st_charge_q++;
 }
 
 /* a scan found melee ammo usable vs this enemy: queue an attack order if the enemy is out of reach */
@@ -648,13 +890,22 @@ static void charge_note(const uint8_t *ctx, int inhand, int stance)
         unit_t *us = unit_of(ent, 0);
         if (us && us->auto_drawn) {
             if (vec_has(ent + cfg_enttags, g_ctagl, 1) != 1 && !auto_active(ent)) us->auto_drawn = 0;
-            else if (d > cfg_ad_dist * 2.0f) return;
+            else if (d > cfg_ad_dist) return;                /* 0.7.26: fight range only (was 2 x): beyond it the unit goes back to its gun */
         }
+    }
+    uint32_t now = *g_clock;
+    if (cfg_fight_on && !veh && d <= cfg_ad_dist) {          /* 0.7.16: fight range -> the melee order (eFight), in reach too */
+        if (fight_running(ent, tgt)) return;                 /* already fighting this enemy */
+        const uint8_t *xt = explicit_target(ent);
+        if (xt && xt != tgt) return;                         /* the player sent it at another enemy: his order stands */
+        last_t *fl = last_of(ent, 0);
+        if (fl && fl->ms && fl->tgt == tgt && (uint32_t)(now - fl->ms) < cfg_fight_cd) return;   /* just ordered (or drawing) */
+        st_fight_q++;
+        goto queue;                                          /* flush: draw first if not in hand, else eFight (d < CloseDistance) */
     }
     float reach = g_range((void *)ammo);
     if (d <= reach * 1.1f + 1.0f || d < cfg_charge_min) return;   /* in reach / already fighting: the engine attacks on its own */
     if (cfg_charge_max > 0 && d > cfg_charge_max) return;
-    uint32_t now = *g_clock;
     last_t *l = last_of(ent, 0);
     if (l && l->ms) {
         /* one order per enemy: a new AddOrder restarts the running attack order (the unit stops and re-paths), so while
@@ -666,6 +917,12 @@ static void charge_note(const uint8_t *ctx, int inhand, int stance)
          * at once. Before, the draw sat under the same cooldown + progress test as a real order, and that test read the
          * ENEMY walking up as the unit closing in: 0.7.0 log, five marines stood 7-17 s after IN HAND (stop-and-stare). */
         int drawn = l->phase == 0 && age >= 200 && vec_has(ent + cfg_enttags, g_ctagl, 1) == 1;
+        /* 0.7.29 zerg: the charge order is no longer in front (the bot's Lua gave the squad a move / hold order, or the run
+         * ended): give it again at once, no stall wait */
+        if (!drawn && !ts && !veh && age >= cfg_zerg_reorder && zerg_unit(ent, ti) && !front_is_mine(ent)) {
+            drawn = 1; st_zerg_reorder++;
+            if (cfg_log && g_zlines < 80) { g_zlines++; logf_("zerg: [%u ms] unit %p charge order replaced (front %s): ordered again (re-orders %ld)", now, (void *)ent, front_order(ent) ? "another order" : "none", (long)st_zerg_reorder); }
+        }
         if (!drawn) {
             int renew = 0;
             if (cur && cur == tgt && l->phase == 1) {                       /* running at it under a move order */
@@ -697,22 +954,8 @@ static void charge_note(const uint8_t *ctx, int inhand, int stance)
             }
         }
     }
-    pend_t *free_ = NULL;
-    for (int i = 0; i < NPEND; i++) {
-        pend_t *p = &g_pend[i];
-        if (p->used && p->unit == ent) {
-            if (veh && !p->veh) return;                       /* infantry already queued: it wins */
-            if (veh == p->veh && d >= p->dist) return;        /* already queued a nearer enemy */
-            ref_free(p->tref); ref_make(p->tref, tgt);
-            p->tgt = tgt; p->dist = d; p->clock = now; p->veh = veh; p->stalled = stalled;
-            return;
-        }
-        if (!p->used && !free_) free_ = p;
-    }
-    if (!free_) return;
-    ref_make(free_->uref, ent); ref_make(free_->tref, tgt);
-    free_->unit = ent; free_->tgt = tgt; free_->dist = d; free_->clock = now; free_->used = 1; free_->veh = veh; free_->stalled = stalled;
-    st_charge_q++;
+queue:;
+    pend_push(ent, tgt, d, veh, stalled, now);
 }
 
 /* ---------------------------------------------------------------- auto-draw queue */
@@ -753,6 +996,27 @@ static void *melee_tags(void)
     return tc;
 }
 
+/* queue one take-item (draw) order for a later tick, unless the melee weapon is in hand, one is queued, or one went out within
+ * DrawCooldownMs (0.7.18: shared by the scan's auto-draw and the order poll); 1 = queued */
+static int dpend_push(uint8_t *ent, unit_t *s, uint32_t now)
+{
+    if (vec_has(ent + cfg_enttags, g_ctagl, 1) == 1) return 0;                  /* melee already in hand */
+    if (s->ad_draw_ms && (uint32_t)(now - s->ad_draw_ms) < cfg_draw_cd) return 0;
+    if (!g_takeitem) return 0;
+    dpend_t *free_ = NULL;
+    for (int i = 0; i < NDPEND; i++) {
+        if (g_dpend[i].used && g_dpend[i].unit == ent) return 0;
+        if (!g_dpend[i].used && !free_) free_ = &g_dpend[i];
+    }
+    if (!free_) return 0;
+    ref_make(free_->uref, ent); free_->unit = ent; free_->clock = now; free_->used = 1;
+    s->ad_draw_ms = now;                                                        /* one queued order per cooldown */
+    return 1;
+}
+
+static int g_rc_force;                     /* 0.7.24: reload_cancel ignores KeepTags (fight-range draws) */
+static int held_weapon_name(uint8_t *u, char *out, size_t cap);
+static const char *queue_info(const uint8_t *u, char *buf, size_t cap);
 static void autodraw_flush(const uint8_t *scanning)
 {
     uint32_t now = *g_clock;
@@ -763,14 +1027,18 @@ static void autodraw_flush(const uint8_t *scanning)
         int done = 0;
         if (u == p->unit && !is_linked(p->unit) && !in_manual(p->unit) && vec_has(p->unit + cfg_enttags, g_ctagl, 1) != 1) {   /* still no melee in hand (0.7.11: not under direct control) */
             void *tags = melee_tags();
+            unit_t *fs = unit_of(p->unit, 1);
+            { char gn[72]; if (held_weapon_name(p->unit, gn, sizeof gn)) memcpy(fs->gun, gn, sizeof fs->gun); }   /* 0.7.26 */
+            g_rc_force = fs->fr_ms && (uint32_t)(now - fs->fr_ms) < 2000;   /* 0.7.24: fight range - heavy weapons give way too (Alex) */
             if (tags && g_takeitem) reload_cancel(p->unit);          /* 0.7.1 */
+            g_rc_force = 0;
             void *o = tags && g_takeitem ? g_takeitem(tags) : NULL;
             uint32_t params[2] = { 1, *g_ordstamp };
             void *ok = o ? g_addorder(p->unit, o, params) : NULL;
             unit_t *s = unit_of(p->unit, 1);
             if (ok) { st_ad_draw++; s->ad_draw_ms = now; s->auto_drawn = 1; }
             done = 1;
-            if (cfg_log && g_adlines < 40) { g_adlines++; logf_("auto-draw: [%u ms] unit %p take-item order %s (auto draws %u, holds %u)", now, (void *)p->unit, ok ? "added" : "REFUSED / no item tags", st_ad_draw, st_ad_hold); }
+            if (cfg_log && g_adlines < 40) { g_adlines++; char qi[160]; logf_("auto-draw: [%u ms] unit %p take-item order %s (auto draws %u, holds %u) | unit now has %s | gun to go back to: \"%s\"", now, (void *)p->unit, ok ? "added" : "REFUSED / no item tags", st_ad_draw, st_ad_hold, queue_info(p->unit, qi, sizeof qi), s->gun); }
         }
         (void)done;
         ref_free(p->uref);
@@ -797,10 +1065,42 @@ static void scan_note(const uint8_t *ctx)
     float d2 = dx * dx + dy * dy + dz * dz;
     uint32_t now = *g_clock;
     int in_inf = cfg_veh_on && d2 <= cfg_inf_range * cfg_inf_range;
-    int in_ad = cfg_ad_on && d2 <= cfg_ad_dist * cfg_ad_dist && carries_melee(ent);
+    int in_ad = cfg_ad_on && d2 <= cfg_ad_dist * cfg_ad_dist && has_melee(ent);   /* 0.7.18: long memory */
     if (in_ad && !cfg_ad_player) {
         const uint8_t *br = *(const uint8_t *const *)(ent + 0xDC8);
         if (br && (br[0x398] & 3) == 1) in_ad = 0;
+    }
+    if (cfg_log && cfg_ad_on && d2 <= cfg_ad_dist * cfg_ad_dist) {             /* 0.7.15: enemy infantry in auto-draw range - log each state change */
+        const uint8_t *br = *(const uint8_t *const *)(ent + 0xDC8);
+        int st = (has_melee(ent) ? 1 : 0) | (vec_has(ent + cfg_enttags, g_ctagl, 1) == 1 ? 2 : 0) | (in_ad ? 4 : 0)
+               | (br && (br[0x398] & 3) == 1 ? 8 : 0) | (tag_stance(ent) ? 16 : 0);
+        unit_t *ds = unit_of(ent, 1);
+        if (ds->ad_diag != st + 1 && g_addiag < 120) {
+            ds->ad_diag = st + 1; g_addiag++;
+            logf_("adiag: [%u ms] unit %p enemy %p at %.0f (draw range %.0f): melee offered recently %d, melee in hand %d, player unit %d, stance %d -> %s",
+                  now, (void *)ent, (const void *)tgt, sqrtf(d2), cfg_ad_dist, st & 1, (st >> 1) & 1, (st >> 3) & 1, (st >> 4) & 1,
+                  !(st & 1) ? "NO DRAW (engine never offered this unit's melee ammo in the last 20 s)"
+                  : (st & 2) ? "nothing to do (in hand)" : (st & 4) ? "draw" : "NO DRAW (PlayerUnits=0)");
+        }
+    }
+    if (cfg_ad_on && cfg_probe_on && (cfg_probe_any || d2 <= cfg_ad_dist * cfg_ad_dist) && !has_melee(ent) && !tag_stance(ent)
+        && vec_has(ent + cfg_enttags, g_ctagl, 1) != 1) {                       /* 0.7.16: enemy close (0.7.18: any enemy), melee unknown -> probe */
+        const uint8_t *br = *(const uint8_t *const *)(ent + 0xDC8);
+        if (cfg_ad_player || !(br && (br[0x398] & 3) == 1)) {
+            unit_t *ps = unit_of(ent, 1);
+            if (ps->probe_ms) {
+                uint32_t age = now - ps->probe_ms;
+                if (age >= cfg_probe_ms && ps->probe_rej) {                       /* only guns offered during the probe */
+                    ps->probe_ms = 0; st_probe_fail++;
+                    ps->nomelee_until = now + cfg_nomelee_ms; if (!ps->nomelee_until) ps->nomelee_until = 1;
+                    if (cfg_log && g_plines < 60) { g_plines++; logf_("probe: [%u ms] unit %p no melee weapon (%d guns refused, none offered): guns kept for %u ms (found %u, none %u)", now, (void *)ent, ps->probe_rej, cfg_nomelee_ms, st_probe_ok, st_probe_fail); }
+                } else if (age >= cfg_probe_ms * 4) ps->probe_ms = 0;            /* no weapon pick seen at all: drop it quietly */
+            } else if (!(ps->nomelee_until && (int32_t)(ps->nomelee_until - now) > 0)
+                       && !(ps->probe_last && (uint32_t)(now - ps->probe_last) < cfg_probe_cd)) {
+                ps->probe_ms = now ? now : 1; ps->probe_last = ps->probe_ms; ps->probe_rej = 0; st_probe++;
+                if (cfg_log && g_plines < 60) { g_plines++; logf_("probe: [%u ms] unit %p enemy %p at %.0f, no melee seen: guns refused for one pick (probes %u)", now, (void *)ent, (const void *)tgt, sqrtf(d2), st_probe); }
+            }
+        }
     }
     if (!in_inf && !in_ad) return;
     unit_t *s = unit_of(ent, 1);
@@ -808,17 +1108,7 @@ static void scan_note(const uint8_t *ctx)
     if (!in_ad) return;
     if (!s->ad_until || (int32_t)(s->ad_until - now) <= 0) st_ad_hold++;
     s->ad_until = now + cfg_ad_hold; if (!s->ad_until) s->ad_until = 1;
-    if (vec_has(ent + cfg_enttags, g_ctagl, 1) == 1) return;                    /* melee already in hand */
-    if (s->ad_draw_ms && (uint32_t)(now - s->ad_draw_ms) < cfg_draw_cd) return;
-    if (!g_takeitem) return;
-    dpend_t *free_ = NULL;
-    for (int i = 0; i < NDPEND; i++) {
-        if (g_dpend[i].used && g_dpend[i].unit == ent) return;
-        if (!g_dpend[i].used && !free_) free_ = &g_dpend[i];
-    }
-    if (!free_) return;
-    ref_make(free_->uref, ent); free_->unit = ent; free_->clock = now; free_->used = 1;
-    s->ad_draw_ms = now;                                                        /* one queued order per cooldown */
+    dpend_push(ent, s, now);
 }
 
 /* 0.7.3: while the unit is pressed against this vehicle, the engine's range test gets a target point at reach x 0.8 in front of
@@ -854,12 +1144,553 @@ static int adj_shift(uint8_t *ctx, float *saved)
     return 1;
 }
 
+/* 0.7.17 weapon picks from ORDERS (Alex's Nov 9 snapshot: under his right-click attack order the Sternguard punched with the
+ * bolter within 5 m; the dll had logged nothing for him after 82 s because the auto-draw / probe / fight order only ran from the
+ * engine's enemy scan, which a unit with an explicit order does not run). Calls from anywhere but the scan are checked here. */
+static int cfg_order_on = 1;         /* [AutoDraw] OrderPicks */
+static int g_olines, g_rawlines;
+static uint8_t *g_exe_lo;            /* exe base, for the caller RVA in the log (set at install) */
+
+/* Whether a weapon pick made for an ORDER (not the AI scan) against enemy infantry inside fight range goes melee (probe /
+ * auto-draw hold / eFight) instead of keeping the engine's own choice (the gun).
+ *   ent            the unit;   tgt  the enemy;   d  distance in world units (20 = 1 m), already <= [AutoDraw] Distance
+ *   player_ordered 1 = the player's (or a script's) own attack order is on THIS enemy (not a dll order)
+ *   stance         1 = the unit is in melee stance (toggle / AlwaysTag)
+ *   heavy          1 = the gun in hand carries a [ReloadCancel] KeepTags tag (heavy bolter, flamer, lascannon, ...)
+ * Alex (Nov 9 2026): "always pull out a melee weapon if possible when ordered to attack within fight range or when the AI is
+ * using them" - every unit, ordered or not, heavy weapons too. "If possible" = the probe: no melee weapon -> the gun stays.
+ * The inputs stay (logged on every order: line) in case a unit class needs an exception later. */
+static int order_goes_melee(const uint8_t *ent, const uint8_t *tgt, float d, int player_ordered, int stance, int heavy)
+{
+    (void)ent; (void)tgt; (void)d; (void)player_ordered; (void)stance; (void)heavy;
+    return 1;
+}
+
+static int holds_keep_weapon(uint8_t *u);   /* [ReloadCancel] KeepTags test on the weapon in hand (below) */
+/* 1 = this order-path pick is against enemy infantry in fight range and the policy says melee; logs each new (unit, enemy) */
+static int order_pick(const uint8_t *ctx, const uint8_t *ret)
+{
+    if (!cfg_order_on || !cfg_ad_on || !g_clock) return 0;
+    uint8_t *ent = *(uint8_t *const *)(ctx + 8);
+    const uint8_t *ti = *(const uint8_t *const *)(ctx + 0x10);
+    if (!ent || !ti || !(ent[0x30] & 0x04) || is_linked(ent) || in_manual(ent)) return 0;
+    const uint8_t *tgt = *(const uint8_t *const *)(ti + 0x18);
+    if (!tgt || tgt == ent || !(tgt[0x30] & 0x04) || tgt[0xDA8] == ent[0xDA8] || linked_raw(tgt)) return 0;
+    float dx = *(const float *)(ent + 0x74) - *(const float *)(ti + 0x28);
+    float dy = *(const float *)(ent + 0x78) - *(const float *)(ti + 0x2C);
+    float dz = *(const float *)(ent + 0x7C) - *(const float *)(ti + 0x30);
+    float d = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (d > cfg_ad_dist) return 0;
+    int po = explicit_target(ent) == tgt, st = tag_stance(ent), hv = holds_keep_weapon(ent);
+    int go = order_goes_melee(ent, tgt, d, po, st, hv);
+    last_t *l = last_of(ent, 1);
+    if (cfg_log && g_olines < 60 && (l->otgt != tgt || l->ogo != go + 1)) {
+        g_olines++;
+        const uint8_t *ammo = *(const uint8_t *const *)ctx; char nm[200]; vec_str(ammo + cfg_namtags + TAGS_VEC, nm, sizeof nm);
+        logf_("order: [%u ms] unit %p weapon pick outside the scan (caller exe+0x%llX) vs enemy %p at %.0f, \"%s\", player order %d stance %d heavy %d -> %s",
+              *g_clock, (void *)ent, (unsigned long long)(g_exe_lo && ret > g_exe_lo ? ret - g_exe_lo : 0), (const void *)tgt, d, nm, po, st, hv,
+              go ? "melee (probe / hold / fight order)" : "engine's choice");
+    }
+    l->otgt = tgt; l->ogo = go + 1;
+    return go;
+}
+
+/* 0.7.18 order poll. Alex's 0.7.17 test: a right-click attack order inside fight range still punched with the bolter, and the
+ * dll logged no weapon pick at all for the unit (no `order:` line, snapshot: one unit ever tracked). Under an explicit attack
+ * order the engine does not re-pick the weapon through MatchAmmo once it has one, so nothing the dll hooks runs for that unit.
+ * So the dll looks at the units itself: every human that ran an enemy scan is remembered (weak refs, KnownUnits slots, least
+ * recently seen replaced), and every PollMs, from some other unit's scan, each one whose front order is an explicit attack
+ * (eAttack / eAttackBasic, not the dll's own) on enemy infantry inside [AutoDraw] Distance is handled like a scan pick in
+ * fight range: melee in hand -> the fight order (eFight); known to carry melee -> drawn (take-item, then the scan path gives
+ * the fight order); melee unknown / none -> left alone (the engine's choice; the probe answers that from the unit's scans). */
+/* 0.7.20: class name of an engine object's vtable through its MSVC RTTI (vt[-1] = CompleteObjectLocator: +0x0C type descriptor
+ * RVA, +0x14 its own RVA; name at type descriptor +0x10, e.g. ".?AUeAttack@Order@@"), every read checked; cached per vtable */
+#define NVTNAME 64
+static void **g_vtn_vt[NVTNAME]; static const char *g_vtn_nm[NVTNAME]; static int g_vtn_n;
+static const char *vt_name(void **vt)
+{
+    if (!vt) return NULL;
+    for (int i = 0; i < g_vtn_n; i++) if (g_vtn_vt[i] == vt) return g_vtn_nm[i];
+    const char *nm = NULL;
+    if (readable(vt - 1, 8)) {
+        const uint8_t *col = (const uint8_t *)vt[-1];
+        if (col && readable(col, 0x18) && *(const uint32_t *)col == 1) {
+            const uint8_t *base = col - *(const uint32_t *)(col + 0x14);
+            const char *n = (const char *)(base + *(const uint32_t *)(col + 0x0C) + 0x10);
+            if (readable(n, 64) && n[0] == '.' && n[1] == '?') nm = n;
+        }
+    }
+    if (g_vtn_n < NVTNAME) { g_vtn_vt[g_vtn_n] = vt; g_vtn_nm[g_vtn_n] = nm; g_vtn_n++; }
+    return nm;
+}
+
+#define NKNOWN 256
+typedef struct { __attribute__((aligned(16))) uint8_t ref[REFSZ]; uint8_t *unit; uint32_t ms; int used; } known_t;
+static known_t g_known[NKNOWN];
+static int cfg_poll_on = 1;                /* [AutoDraw] OrderPoll */
+static uint32_t cfg_poll_ms = 250;         /* [AutoDraw] PollMs */
+static uint32_t cfg_blind_ms = 8000;       /* 0.7.19 [AutoDraw] BlindCheckMs: a draw tried without knowing is judged after this */
+static uint32_t g_poll_last, st_poll_fight, st_poll_draw, st_poll_unknown;
+static int g_polllines, g_ovtlines;
+static void known_note(uint8_t *ent, uint32_t now)
+{
+    known_t *free_ = NULL, *old = NULL;
+    for (int i = 0; i < NKNOWN; i++) {
+        known_t *k = &g_known[i];
+        if (k->used && k->unit == ent) { k->ms = now; return; }
+        if (!k->used) { if (!free_) free_ = k; }
+        else if (!old || (int32_t)(k->ms - old->ms) < 0) old = k;
+    }
+    known_t *k = free_ ? free_ : old;
+    if (!k) return;
+    if (k->used) ref_free(k->ref);
+    ref_make(k->ref, ent); k->unit = ent; k->ms = now; k->used = 1;
+}
+/* 0.7.22 wanted fights: the poll drew a melee weapon for a unit ordered onto an enemy in fight range; as soon as the weapon is
+ * in hand the unit gets the fight order on that enemy, whatever became of the attack order meanwhile (the take-item order may
+ * replace it). Weak refs; dropped after WANT_MS or when the unit / enemy is gone. */
+#define NWANT 32
+#define WANT_MS 12000
+typedef struct { __attribute__((aligned(16))) uint8_t uref[REFSZ]; __attribute__((aligned(16))) uint8_t tref[REFSZ];
+                 uint8_t *unit, *tgt; uint32_t ms; int used, esc, kind; } want_t;   /* kind 1 (0.7.26): attack order once the melee weapon is away */
+static want_t g_want[NWANT];
+static uint32_t st_want_fight, st_want_esc;
+/* 0.7.24: which owner players have been seen hostile to each other (an enemy scan's target, an attack order's target): the
+ * fight-range search only pairs units of such owners (a different owner alone may be an ally) */
+static uint8_t g_hostile[256][32];
+static void hostile_set(uint8_t a, uint8_t b) { if (a != b) { g_hostile[a][b >> 3] |= (uint8_t)(1 << (b & 7)); g_hostile[b][a >> 3] |= (uint8_t)(1 << (a & 7)); } }
+static int hostile_is(uint8_t a, uint8_t b) { return a != b && (g_hostile[a][b >> 3] >> (b & 7)) & 1; }
+static int cfg_prox_on = 1;                /* [AutoDraw] Proximity */
+static float cfg_leave = 1.5f;             /* 0.7.27 [AutoDraw] LeaveFactor: a unit the dll put into melee stays in it until the enemy is beyond
+                                            * Distance x this (Alex's 0.7.26 log: target at 116 -> gun, 3 s later at 96 -> knife again) */
+static uint32_t cfg_esc_ms = 1500;         /* [AutoDraw] EscalateMs: knife still not in hand this long after the draw -> the fight order anyway */
+/* g_pend_ff (declared above pend_push): the next pend_push gives the fight order even without the melee weapon in hand */
+static const char *queue_info(const uint8_t *u, char *buf, size_t cap)
+{
+    const uint8_t *b = *(const uint8_t *const *)(u + 0xDC8);
+    const uint8_t *o = (const uint8_t *)front_order(u);
+    const char *nm = o ? vt_name(*(void **const *)o) : NULL;
+    int cnt = b && (*(const uint32_t *)(b + 0x39C) & 0x1000) ? *(const int32_t *)(b + 0x88) : (o ? 1 : 0);
+    snprintf(buf, cap, "%d order(s), front %s%s", cnt, o ? (nm ? nm : "?") : "none", holds_keep_weapon((uint8_t *)u) ? ", heavy weapon in hand" : "");
+    return buf;
+}
+static void want_drop(const uint8_t *u)
+{
+    for (int i = 0; i < NWANT; i++)
+        if (g_want[i].used && g_want[i].unit == u) { ref_free(g_want[i].uref); ref_free(g_want[i].tref); g_want[i].used = 0; }
+}
+static void want_add_k(uint8_t *u, uint8_t *tgt, uint32_t now, int kind)
+{
+    want_t *free_ = NULL;
+    for (int i = 0; i < NWANT; i++) {
+        want_t *w = &g_want[i];
+        if (w->used && w->unit == u) {
+            if (w->tgt != tgt) { ref_free(w->tref); ref_make(w->tref, tgt); w->tgt = tgt; }
+            if (w->kind != kind) { w->kind = kind; w->esc = 0; }
+            w->ms = now; return;
+        }
+        if (!w->used && !free_) free_ = w;
+    }
+    if (!free_) return;
+    ref_make(free_->uref, u); ref_make(free_->tref, tgt);
+    free_->unit = u; free_->tgt = tgt; free_->ms = now; free_->used = 1; free_->esc = 0; free_->kind = kind;
+}
+static void want_add(uint8_t *u, uint8_t *tgt, uint32_t now) { want_add_k(u, tgt, now, 0); }
+static uint32_t st_gun_try, st_gun_draw, st_atk_back;
+static int g_rblines;
+static int ranged_back(uint8_t *u, uint32_t now, uint8_t *atk_tgt);
+static void want_poll(const uint8_t *scanning, uint32_t now)
+{
+    for (int i = 0; i < NWANT; i++) {
+        want_t *w = &g_want[i];
+        if (!w->used) continue;
+        uint8_t *u = (uint8_t *)ref_ent(w->uref), *t = (uint8_t *)ref_ent(w->tref);
+        if (u != w->unit || t != w->tgt || (uint32_t)(now - w->ms) > WANT_MS) { ref_free(w->uref); ref_free(w->tref); w->used = 0; continue; }
+        if (u == scanning || is_linked(u) || in_manual(u)) continue;
+        if (cfg_down_on && vec_has(t + cfg_enttags, cfg_downtag, 1) == 1) { ref_free(w->uref); ref_free(w->tref); w->used = 0; continue; }
+        if (w->kind == 1) {                                                     /* 0.7.26: the attack order the dll took away comes back */
+            if (vec_has(u + cfg_enttags, g_ctagl, 1) == 1 && (uint32_t)(now - w->ms) < 4000) continue;   /* melee weapon still in hand */
+            uint32_t params[2] = { 1, *g_ordstamp };
+            void *o = g_mkatk ? g_mkatk(w->tref, 0) : NULL, *ok = o ? g_addorder(u, o, params) : NULL;
+            st_atk_back++;
+            if (cfg_log && g_rblines < 60) { g_rblines++; logf_("ranged: [%u ms] unit %p attack order on enemy %p at %.0f given back %s (%u)", now, (void *)u, (void *)t, dist3(u, t), ok ? "" : "- REFUSED", st_atk_back); }
+            ref_free(w->uref); ref_free(w->tref); w->used = 0; continue;
+        }
+        unit_t *s = unit_of(u, 1);
+        s->ad_until = now + cfg_ad_hold; if (!s->ad_until) s->ad_until = 1;     /* guns stay refused while the draw runs */
+        if (vec_has(u + cfg_enttags, g_ctagl, 1) != 1) {                        /* not in hand yet */
+            /* 0.7.24: 0.7.23 log - take-item "added" under an eAttack order, nothing in hand 2.6 s later, eAttack still in
+             * front. If the draw has not shown after EscalateMs, give the fight order anyway (it replaces the gun attack) and
+             * log what the unit's order queue looks like, so the next log says what the take-item order was waiting behind. */
+            if (!w->esc && cfg_esc_ms && (uint32_t)(now - w->ms) >= cfg_esc_ms && dist3(u, t) <= cfg_ad_dist * 2.0f) {
+                char qi[160]; w->esc = 1; st_want_esc++;
+                g_pend_ff = 1; pend_push(u, t, dist3(u, t), 0, 0, now); g_pend_ff = 0;
+                if (cfg_log && g_polllines < 80) { g_polllines++; logf_("poll: [%u ms] unit %p melee weapon still not in hand %u ms after the draw (%s): fight order on %p anyway (escalations %u)", now, (void *)u, now - w->ms, queue_info(u, qi, sizeof qi), (void *)t, st_want_esc); }
+            }
+            continue;
+        }
+        const uint8_t *xt = explicit_target(u);
+        float d = dist3(u, t);
+        if (!fight_running(u, t) && (!xt || xt == t) && d <= cfg_ad_dist * 3.0f) {
+            pend_push(u, t, d, 0, 0, now); st_want_fight++; st_fight_q++;
+            if (cfg_log && g_polllines < 80) { g_polllines++; logf_("poll: [%u ms] unit %p melee weapon in hand: fight order on enemy %p at %.0f queued (wanted fights %u)", now, (void *)u, (void *)t, d, st_want_fight); }
+        }
+        if (s->blind_ms) { s->blind_ms = 0; melee_known(u); }
+        ref_free(w->uref); ref_free(w->tref); w->used = 0;
+    }
+}
+static void order_poll(const uint8_t *scanning, uint32_t now)
+{
+    if (!cfg_poll_on || !cfg_ad_on || (!g_vt_attack && !g_vt_attackb)) return;
+    if (g_poll_last && (uint32_t)(now - g_poll_last) < cfg_poll_ms) return;
+    g_poll_last = now ? now : 1;
+    st_hk_polls++;
+    want_poll(scanning, now);                                                   /* 0.7.22 */
+    static uint8_t *live[NKNOWN];                                               /* 0.7.25: each unit resolved once per poll */
+    for (int i = 0; i < NKNOWN; i++) {
+        known_t *k = &g_known[i]; live[i] = NULL;
+        if (!k->used) continue;
+        uint8_t *v = (uint8_t *)ref_ent(k->ref);
+        if (v != k->unit) { ref_free(k->ref); k->used = 0; continue; }          /* entity gone */
+        live[i] = v;
+    }
+    for (int i = 0; i < NKNOWN; i++) {
+        uint8_t *u = live[i];
+        if (!u) continue;
+        if (u == scanning || !(u[0x30] & 0x04) || is_linked(u) || in_manual(u)) continue;
+        const uint8_t *o = (const uint8_t *)front_order(u);
+        void **vt = o ? *(void **const *)o : NULL;
+        /* 0.7.20 (0.7.19 test: no poll line for a unit on a right-click attack order): log every change of a unit's front order
+         * class (RTTI name) with its target, and accept any class named *Attack* / *Fight* (not only eAttack / eAttackBasic) */
+        const char *onm = vt_name(vt);
+        int tty = o && readable(o + 0x48, 0x18) ? (int)*(const uint32_t *)(o + 0x48) : -1;
+        uint8_t *tgt = tty == 1 ? *(uint8_t *const *)(o + 0x58) : NULL;
+        if (tgt && !readable(tgt, 0xDB0)) tgt = NULL;
+        {
+            unit_t *ls = unit_of(u, 1);
+            if (ls->ovt != (const void *)vt && cfg_log && g_ovtlines < 150) {
+                g_ovtlines++;
+                logf_("orders: [%u ms] unit %p front order now %s (vt exe+0x%llX)%s, target type %d %p%s, at %.0f",
+                      now, (void *)u, onm ? onm : (o ? "?" : "none"), (unsigned long long)(vt && g_exe_lo && (uint8_t *)vt > g_exe_lo ? (uint8_t *)vt - g_exe_lo : 0),
+                      vt == g_vt_attack ? " = eAttack" : vt == g_vt_attackb ? " = eAttackBasic" : vt == g_vt_fight ? " = eFight" : "",
+                      tty, (void *)tgt, tgt && (tgt[0x30] & 0x04) ? " (human)" : "", tgt ? dist3(u, tgt) : -1.0f);
+            }
+            ls->ovt = (const void *)vt;
+        }
+        /* 0.7.24 fight-range stance (Alex: "put them in that stance when they are in fight range, then after there's no target
+         * in fight range they go back to range stance"). The enemy is the unit's attack-order target when that is within
+         * [AutoDraw] Distance, else the nearest known hostile human within it - for a unit that is idle, on an attack order, or
+         * on one of the dll's own orders (a player / AI move order is left alone). In range: guns held off, melee weapon drawn,
+         * then the fight order; nobody in range any more: the hold runs out after HoldMs and the unit shoots again. */
+        if (cfg_down_on && vec_has(u + cfg_enttags, cfg_downtag, 1) == 1) continue;
+        if (vt && vt == g_vt_fight) {                                           /* fighting: stay in the stance */
+            unit_t *fs = unit_of(u, 1); fs->ad_until = now + cfg_ad_hold; if (!fs->ad_until) fs->ad_until = 1; fs->fr_ms = now;
+            continue;
+        }
+        /* order classes in the 1.067 exes that attack a target (eAirAttack / eAttackProximityCharge / eSuppressionFire left out) */
+        int attackish = vt == g_vt_attack || vt == g_vt_attackb
+                     || (onm && (!strcmp(onm, ".?AUeAttack@Order@@") || !strcmp(onm, ".?AUeAttackBasic@Order@@")
+                                 || !strcmp(onm, ".?AUeAttackBySelector@Order@@") || !strcmp(onm, ".?AUeWeaponFire@Order@@")
+                                 || !strcmp(onm, ".?AUeWeaponAimTarget@Order@@")));
+        int mine = 0; if (o) for (int j = 0; j < NMINE; j++) if (g_mine[j] == o) mine = 1;
+        if (o && !attackish && !mine) { ranged_back(u, now, NULL); continue; }   /* moving / other order: not ours to interrupt (0.7.26: but the gun comes back) */
+        uint8_t *otgt = (o && attackish && !mine && tgt && tgt != u && (tgt[0x30] & 0x04) && tgt[0xDA8] != u[0xDA8] && !linked_raw(tgt)
+                         && !(cfg_down_on && vec_has(tgt + cfg_enttags, cfg_downtag, 1) == 1) && !ignored_target(tgt)) ? tgt : NULL;
+        if (otgt) { hostile_set(u[0xDA8], otgt[0xDA8]); known_note(otgt, now); }
+        float d = 1e9f; tgt = NULL;
+        /* 0.7.27: in at Distance, out at Distance x LeaveFactor (only for a unit holding the melee weapon the dll drew) */
+        unit_t *hs = unit_of(u, 0);
+        float rng = cfg_ad_dist * ((cfg_leave > 1.0f && hs && hs->gun[0] && vec_has(u + cfg_enttags, g_ctagl, 1) == 1) ? cfg_leave : 1.0f);
+        if (otgt) { float od = dist3(u, otgt); if (od <= rng) { tgt = otgt; d = od; } else if (!mine) { ranged_back(u, now, otgt); continue; } }   /* ordered onto a far enemy: his call, with his gun (0.7.26) */
+        if (!tgt && cfg_prox_on) {
+            for (int j = 0; j < NKNOWN; j++) {
+                uint8_t *v = live[j];
+                if (!v || j == i || !hostile_is(u[0xDA8], v[0xDA8]) || !(v[0x30] & 0x04) || linked_raw(v)) continue;
+                float dd = dist3(u, v);
+                if (dd > rng || dd >= d) continue;
+                if (cfg_down_on && vec_has(v + cfg_enttags, cfg_downtag, 1) == 1) continue;
+                if (ignored_target(v)) continue;                                /* 0.7.28 */
+                tgt = v; d = dd;
+            }
+        }
+        if (!tgt) { ranged_back(u, now, NULL); continue; }
+        unit_of(u, 1)->fr_ms = now;
+        if (!order_goes_melee(u, tgt, d, 1, tag_stance(u), holds_keep_weapon(u))) continue;
+        unit_t *s = unit_of(u, 1);
+        int inhand = vec_has(u + cfg_enttags, g_ctagl, 1) == 1;
+        const char *what;
+        if (inhand) {
+            if (s->blind_ms) { s->blind_ms = 0; melee_known(u); }                 /* 0.7.19: the blind draw worked */
+            s->ad_until = now + cfg_ad_hold; if (!s->ad_until) s->ad_until = 1;   /* 0.7.24: stance held while an enemy is in range */
+            if (fight_running(u, tgt)) continue;
+            last_t *fl = last_of(u, 0);
+            if (fl && fl->ms && fl->tgt == tgt && (uint32_t)(now - fl->ms) < cfg_fight_cd) continue;
+            pend_push(u, tgt, d, 0, 0, now); st_poll_fight++; st_fight_q++;
+            what = "melee in hand: fight order queued";
+        } else if (has_melee(u)) {
+            s->ad_until = now + cfg_ad_hold; if (!s->ad_until) s->ad_until = 1;   /* guns refused if the engine does re-pick */
+            want_add(u, tgt, now);                                                /* 0.7.22: fight order once it is in hand */
+            if (!dpend_push(u, s, now)) continue;                                 /* in hand / queued / within DrawCooldownMs */
+            st_poll_draw++;
+            what = "carries melee: draw queued (then the fight order)";
+        } else if (s->nomelee_until && (int32_t)(s->nomelee_until - now) > 0) {
+            st_poll_unknown++;
+            if (s->poll_ms && (uint32_t)(now - s->poll_ms) < 5000) continue;      /* log it once in a while only */
+            what = "no melee weapon (probe / button / draw): keeps the gun";
+        } else if (!s->blind_ms) {
+            /* 0.7.19: nothing knows yet (never scanned, no toggle click this session): do what the toggle does - order the draw -
+             * and look again after BlindCheckMs */
+            if (!dpend_push(u, s, now)) continue;
+            want_add(u, tgt, now);                                                /* 0.7.22 */
+            s->blind_ord = otgt == tgt;
+            s->blind_ms = now ? now : 1; st_poll_unknown++; st_poll_draw++;
+            what = "melee unknown: draw tried like the toggle (checked again in BlindCheckMs)";
+        } else {
+            /* 0.7.26: over as soon as the take-item order has left the queue (1.2 s minimum), not only after BlindCheckMs */
+            int taking = onm && !strcmp(onm, ".?AUeTakeItem@Order@@");
+            if ((uint32_t)(now - s->blind_ms) < cfg_blind_ms && ((uint32_t)(now - s->blind_ms) < 1200 || taking)) continue;
+            if (s->blind_ord) want_add_k(u, tgt, now, 1); else want_drop(u);       /* the draw dropped his attack order: give it back */
+            s->blind_ord = 0;
+            s->blind_ms = 0; s->nomelee_until = now + cfg_nomelee_ms; if (!s->nomelee_until) s->nomelee_until = 1;
+            what = "draw tried, nothing in hand: no melee weapon, keeps the gun";
+        }
+        s->poll_ms = now ? now : 1;
+        if (cfg_log && g_polllines < 80) {
+            g_polllines++;
+            logf_("poll: [%u ms] unit %p enemy %p in fight range at %.0f (%s): %s (fights %u, draws %u, unknown %u)",
+                  now, (void *)u, (void *)tgt, d, otgt == tgt ? "his attack order's target" : "nearest hostile", what, st_poll_fight, st_poll_draw, st_poll_unknown);
+        }
+    }
+}
+
+/* 0.7.22 own tick. Alex's 0.7.21 heartbeat: ONE hook call in a whole session with a unit under an attack order - the engine
+ * asks for a weapon so rarely there that nothing hanging off the hook (queue flushes, the order poll) ever ran. The dll now
+ * ticks itself on the game's main thread: a WH_GETMESSAGE hook on the thread that owns the game window, woken by a posted
+ * thread message every TickMs from the helper thread. The message pump runs between frames, the place the engine handles UI
+ * clicks from (the melee toggle gives its take-item order from there). Interlock: the tick only acts on a thread the dll has
+ * seen the engine use (the scan hook or a button click), and only while the sim clock advances. */
+static int cfg_tick_on = 1;                /* [AutoDraw] Tick */
+static uint32_t cfg_tick_ms = 100;         /* [AutoDraw] TickMs */
+static volatile DWORD g_sim_tid, g_ui_tid;
+static volatile LONG g_in_hook, g_in_tick, st_ticks, st_tick_wrongthread;
+static DWORD g_tick_wall; static uint32_t g_tick_clock;
+static volatile LONG64 st_tick_us;         /* 0.7.25: time spent in the tick's work, microseconds (heartbeat) */
+static volatile LONG st_tick_us_max;
+static void ms_tick(void)
+{
+    if (!cfg_tick_on || !g_clock || g_in_hook || g_in_tick) return;
+    DWORD t = GetTickCount();
+    if (t - g_tick_wall < cfg_tick_ms / 2) return;
+    g_tick_wall = t;
+    uint32_t now = *g_clock;
+    if (!now || now == g_tick_clock) return;                    /* no mission running / paused */
+    DWORD tid = GetCurrentThreadId();
+    if (!g_sim_tid && !g_ui_tid) return;                        /* engine thread not seen yet */
+    if (tid != g_sim_tid && tid != g_ui_tid) { st_tick_wrongthread++; return; }
+    g_tick_clock = now;
+    g_in_tick = 1; st_ticks++;
+    LARGE_INTEGER q0, q1, qf; QueryPerformanceCounter(&q0);
+    log_epoch(now);
+    if (cfg_charge && g_addorder && g_ordstamp) charge_flush(NULL);
+    if ((cfg_ad_on || cfg_veh_on) && g_addorder && g_ordstamp) autodraw_flush(NULL);
+    order_poll(NULL, now);
+    QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&qf);
+    LONG us = (LONG)((q1.QuadPart - q0.QuadPart) * 1000000 / qf.QuadPart);
+    st_tick_us += us; if (us > st_tick_us_max) st_tick_us_max = us;
+    g_in_tick = 0;
+}
+/* 0.7.23 frame hook. 0.7.22's message-pump tick never ran: the window thread (22432 in Alex's log) is not the engine thread
+ * (32836: scan hook, button clicks and order events all arrive there). The engine thread is a worker loop (editor exe+0x93F80:
+ * wait, `call [rax+8]`, signal, repeat) whose job is one frame (editor exe+0x40CAB0, the "main_loop" scopes), reached through a
+ * vtable slot. That slot is found at run time from the engine thread's own stack, with no signature: the three outermost exe
+ * return addresses are thread start / worker loop / frame function; the worker's must follow an indirect `call [reg+d8]`, and
+ * the frame function's address must sit in exactly one pointer slot of the image with a vtable header before it. The slot is
+ * then pointed at frame_hook: tick first (frame start, nothing being iterated), then the engine's function. */
+typedef void *(__attribute__((ms_abi)) *frame_fn_t)(void *, void *, void *, void *);
+static frame_fn_t g_frame_orig;
+static volatile LONG g_frame_state;        /* 0 not tried, 1 hooked, 2 failed */
+/* 0.7.24 export for the other GEM dlls (GEM Teleport 0.2.7 asked: it needs an engine-thread call every quant to notice the
+ * jump cursor being cancelled): callbacks run once per quant on the engine thread, right after this dll's own tick, from the
+ * quant hook (so only once that hook is installed: after the first enemy scan or order event of the session). Up to 4,
+ * NULL / duplicates ignored, registration lock-free and allowed at any time. Callbacks must not give orders. */
+typedef void (__attribute__((ms_abi)) *quant_cb_t)(void);
+#define NQUANTCB 4
+static void *volatile g_quant_cb[NQUANTCB];
+__declspec(dllexport) __attribute__((ms_abi)) void gem_quant_listen(quant_cb_t cb)
+{
+    if (!cb) return;
+    for (int i = 0; i < NQUANTCB; i++) if (g_quant_cb[i] == (void *)cb) return;
+    for (int i = 0; i < NQUANTCB; i++)
+        if (InterlockedCompareExchangePointer((void *volatile *)&g_quant_cb[i], (void *)cb, NULL) == NULL) {
+            logf_("quant listeners: callback %p registered (slot %d of %d); live %s", (void *)cb, i + 1, NQUANTCB,
+                  g_frame_state == 1 ? "now" : "once the quant hook is installed");
+            return;
+        }
+}
+static __attribute__((ms_abi, used, noinline)) void *frame_hook(void *a, void *b, void *c, void *d)
+{
+    ms_tick();
+    for (int i = 0; i < NQUANTCB; i++) { quant_cb_t cb = (quant_cb_t)g_quant_cb[i]; if (cb) cb(); }
+    return g_frame_orig(a, b, c, d);
+}
+static int ret_after_call(const uint8_t *r, int *indirect_d8)
+{
+    *indirect_d8 = 0;
+    if (r[-5] == 0xE8) return 1;
+    if (r[-6] == 0xFF && r[-5] == 0x15) return 1;
+    if (r[-3] == 0xFF && (r[-2] & 0xF8) == 0x50) { *indirect_d8 = 1; return 1; }      /* call [reg+d8] */
+    if (r[-2] == 0xFF && ((r[-1] & 0xF8) == 0xD0 || (r[-1] & 0xF8) == 0x10)) return 1;
+    if (r[-6] == 0xFF && (r[-5] & 0xF8) == 0x90) return 1;
+    return 0;
+}
+static void frame_hook_try(void)
+{
+    if (!cfg_tick_on || InterlockedCompareExchange(&g_frame_state, 2, 0) != 0) return;   /* once; 2 unless it succeeds */
+    uint8_t *img = (uint8_t *)GetModuleHandleA(NULL);
+    IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)(img + ((IMAGE_DOS_HEADER *)img)->e_lfanew);
+    uint8_t *img_end = img + nt->OptionalHeader.SizeOfImage;
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    uint8_t *tlo = NULL, *thi = NULL;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        if (!memcmp(sec[i].Name, ".text", 5)) { tlo = img + sec[i].VirtualAddress; thi = tlo + sec[i].Misc.VirtualSize; }
+    if (!tlo) { logf_("tick: no .text section, frame hook off"); return; }
+    volatile uintptr_t marker = 0;
+    uintptr_t *sp = (uintptr_t *)(((uintptr_t)&marker + 7) & ~(uintptr_t)7), *base = (uintptr_t *)__readgsqword(0x08);
+    uint8_t *ret[3] = { 0, 0, 0 }; int ind[3] = { 0, 0, 0 };                              /* [0] outermost */
+    for (uintptr_t *p = base - 1; p >= sp; p--) {                                          /* from the stack base inwards */
+        uint8_t *v = (uint8_t *)*p; int d8;
+        if (v < tlo + 8 || v >= thi) continue;
+        DWORD64 ib; if (!RtlLookupFunctionEntry((DWORD64)v, &ib, NULL)) continue;
+        if (!ret_after_call(v, &d8)) continue;
+        int n = !ret[0] ? 0 : !ret[1] ? 1 : 2;
+        ret[n] = v; ind[n] = d8;
+        if (n == 2) break;
+    }
+    if (!ret[2]) { logf_("tick: engine thread stack has fewer than 3 exe frames, frame hook off"); return; }
+    DWORD64 ib = 0; RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry((DWORD64)ret[2], &ib, NULL);
+    uint8_t *fn = rf ? (uint8_t *)ib + rf->BeginAddress : NULL;
+    if (!fn || !ind[1]) {
+        logf_("tick: outer frames exe+0x%llX / exe+0x%llX / exe+0x%llX do not look like thread start / worker loop (indirect call %d) / frame function, frame hook off",
+              (unsigned long long)(ret[0] - img), (unsigned long long)(ret[1] - img), (unsigned long long)(ret[2] - img), ind[1]);
+        return;
+    }
+    uint8_t **slot = NULL; int hits = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) continue;
+        uint8_t **a = (uint8_t **)(img + sec[i].VirtualAddress), **e = a + sec[i].Misc.VirtualSize / 8;
+        if (!readable(a, (size_t)((uint8_t *)e - (uint8_t *)a))) continue;
+        for (; a < e; a++) if (*a == fn) { slot = a; hits++; }
+    }
+    if (hits != 1 || slot[-2] < img || slot[-2] >= img_end) {
+        logf_("tick: frame function exe+0x%llX has %d pointer slots (need 1 with a vtable header), frame hook off", (unsigned long long)(fn - img), hits);
+        return;
+    }
+    /* the slot's class must be the engine's quant executor (Scene::eQuantExecutor in all three 1.067 exes: vt[1] = run one quant) */
+    const char *cls = vt_name((void **)(slot - 1));
+    if (!cls || !strstr(cls, "QuantExecutor")) {
+        logf_("tick: slot exe+0x%llX belongs to %s, not the quant executor, frame hook off", (unsigned long long)((uint8_t *)slot - img), cls ? cls : "an unnamed class");
+        return;
+    }
+    DWORD old;
+    if (!VirtualProtect(slot, 8, PAGE_READWRITE, &old)) { logf_("tick: cannot write the vtable slot (%lu), frame hook off", GetLastError()); return; }
+    g_frame_orig = (frame_fn_t)(void *)fn;
+    *slot = (uint8_t *)(void *)frame_hook;
+    VirtualProtect(slot, 8, old, &old);
+    g_frame_state = 1;
+    logf_("tick: %s run-quant function exe+0x%llX (worker loop exe+0x%llX, thread start exe+0x%llX), vtable slot exe+0x%llX hooked: the dll ticks at the start of each quant on engine thread %lu",
+          cls, (unsigned long long)(fn - img), (unsigned long long)(ret[1] - img), (unsigned long long)(ret[0] - img),
+          (unsigned long long)((uint8_t *)slot - img), GetCurrentThreadId());
+}
+/* order events from GEM Teleport's GiveOrder hook, when that dll exports gem_order_listen (0.2.3+): the unit is put on the poll
+ * list the moment it is given any order and the next tick polls at once. Nothing is ordered from inside the callback. */
+static volatile LONG st_order_events;
+static void order_event(void *entity, void *order)
+{
+    (void)order;
+    uint8_t *e = (uint8_t *)entity;
+    if (!e || g_in_tick || g_in_hook || !g_clock || !cfg_poll_on) return;
+    if (!readable(e, 0xDB0) || !(e[0x30] & 0x04) || is_linked(e)) return;
+    if (!g_ui_tid) g_ui_tid = GetCurrentThreadId();
+    frame_hook_try();                                           /* 0.7.23: first call on the engine thread finds the frame function */
+    st_order_events++;
+    known_note(e, *g_clock);
+    g_poll_last = 0;                                            /* poll on the next tick, not after PollMs */
+}
+/* helper thread: wakes the main thread for the tick, connects to GEM Teleport, writes the heartbeat. No engine calls here. */
+static DWORD WINAPI hb_thread(LPVOID p)
+{
+    (void)p;
+    LONG last = -1, lastt = -1; int lines = 0, listen = 0, tries = 0; DWORD hbwall = GetTickCount();
+    for (;;) {
+        Sleep(100);
+        if (!listen && tries < 600 && (++tries % 10) == 0) {    /* teleport loads after this dll: look for it for a minute */
+            HMODULE m = GetModuleHandleA("gem_teleport.dll");
+            void (*reg)(void (*)(void *, void *)) = m ? (void (*)(void (*)(void *, void *)))(void *)GetProcAddress(m, "gem_order_listen") : NULL;
+            if (reg) { reg(order_event); listen = 1; logf_("orders: listening to GEM Teleport's GiveOrder hook (gem_order_listen)"); }
+            else if (tries == 600) logf_("orders: no gem_order_listen export in gem_teleport.dll (0.2.3+): order poll only");
+        }
+        if (GetTickCount() - hbwall < 5000) continue;
+        hbwall = GetTickCount();
+        LONG all = st_hk_all, tk = st_ticks;
+        if ((all == last && tk == lastt) || lines >= 400) continue;
+        last = all; lastt = tk; lines++;
+        int known = 0; for (int i = 0; i < NKNOWN; i++) if (g_known[i].used) known++;
+        LONG mx = InterlockedExchange(&st_tick_us_max, 0);
+        logf_("hb: [%u ms] hook calls %ld (scan %ld, humans %ld, human vs enemy human %ld) | frame hook %s, ticks %ld (wrong thread %ld; sim %lu ui %lu) polls %ld, order events %ld, units on the poll list %d | tick cost: %lld us total, %ld us average, %ld us worst since the last line",
+              g_clock ? *g_clock : 0, all, (LONG)st_hk_scan, (LONG)st_hk_human, (LONG)st_hk_enemy,
+              g_frame_state == 1 ? "ON" : g_frame_state == 2 ? "FAILED" : "not tried yet", tk, (LONG)st_tick_wrongthread,
+              (DWORD)g_sim_tid, (DWORD)g_ui_tid, (LONG)st_hk_polls, (LONG)st_order_events, known,
+              (long long)st_tick_us, tk ? (LONG)(st_tick_us / tk) : 0, mx);
+    }
+    return 0;
+}
+static void hook_leave(int *x) { (void)x; g_in_hook--; }
+
 __attribute__((used, ms_abi, noinline)) void *ms_hook(uint8_t *ctx)
 {
     uint8_t *ret = (uint8_t *)__builtin_return_address(0);
     int from_scan = g_clock && g_scan_lo && ret >= g_scan_lo && ret < g_scan_hi;
+    g_in_hook++; int hook_guard __attribute__((cleanup(hook_leave), unused)) = 0;   /* 0.7.22: no tick inside the hook */
+    if (from_scan && !g_sim_tid) g_sim_tid = GetCurrentThreadId();
+    if (from_scan) frame_hook_try();                           /* 0.7.23 */
+    {   /* 0.7.28: a target the dll must ignore (hidden / melee_disabled / call-ins) -> the engine picks on its own */
+        const uint8_t *iti = *(const uint8_t *const *)(ctx + 0x10);
+        const uint8_t *itg = iti ? *(const uint8_t *const *)(iti + 0x18) : NULL;
+        if (itg && (itg[0x30] & 0x02) && ignored_target(itg)) { st_hk_all++; st_tgt_ignored++; return g_orig(ctx); }
+    }
     if (from_scan && cfg_charge) charge_flush(*(uint8_t **)(ctx + 8));
     if (from_scan && (cfg_ad_on || cfg_veh_on)) { autodraw_flush(*(uint8_t **)(ctx + 8)); scan_note(ctx); }
+    st_hk_all++; if (from_scan) st_hk_scan++;                  /* 0.7.21 heartbeat counters */
+    {
+        const uint8_t *he = *(const uint8_t *const *)(ctx + 8), *hti = *(const uint8_t *const *)(ctx + 0x10);
+        if (he && (he[0x30] & 0x04)) {
+            st_hk_human++;
+            const uint8_t *ht = hti ? *(const uint8_t *const *)(hti + 0x18) : NULL;
+            if (ht && (ht[0x30] & 0x04) && ht[0xDA8] != he[0xDA8]) st_hk_enemy++;
+        }
+    }
+    if (from_scan && g_clock) {                                /* 0.7.18: remember the scanning unit; poll the ordered ones */
+        uint8_t *su = *(uint8_t **)(ctx + 8);
+        if (su && (su[0x30] & 0x04) && cfg_poll_on) known_note(su, *g_clock);
+        const uint8_t *sti = *(const uint8_t *const *)(ctx + 0x10);              /* 0.7.19: the scan's target too - a unit on an */
+        uint8_t *st = sti ? *(uint8_t *const *)(sti + 0x18) : NULL;              /* order never scans, but the enemy's scans see it */
+        if (st && st != su && (st[0x30] & 0x04) && !linked_raw(st) && cfg_poll_on) known_note(st, *g_clock);
+        if (su && st && st != su && (su[0x30] & 0x04) && (st[0x30] & 0x04)) hostile_set(su[0xDA8], st[0xDA8]);   /* 0.7.24: an enemy scan's target is hostile */
+        order_poll(su, *g_clock);
+    }
+    if (!from_scan && cfg_log && g_rawlines < 40) {            /* 0.7.18: what reaches the hook from outside the scan, unfiltered */
+        g_rawlines++;
+        const uint8_t *ti = *(const uint8_t *const *)(ctx + 0x10);
+        logf_("raw: [%u ms] hook call from exe+0x%llX: unit %p ti %p target %p", g_clock ? *g_clock : 0,
+              (unsigned long long)(g_exe_lo && ret > g_exe_lo ? ret - g_exe_lo : 0), *(void **)(ctx + 8), (const void *)ti,
+              ti ? *(void *const *)(ti + 0x18) : NULL);
+    }
+    if (!from_scan && g_clock && cfg_poll_on) {                /* 0.7.19: a unit seen picking a weapon for an order is polled too */
+        uint8_t *ou = *(uint8_t **)(ctx + 8);
+        if (ou && (ou[0x30] & 0x04) && !is_linked(ou)) known_note(ou, *g_clock);
+    }
+    int ord = !from_scan && order_pick(ctx, ret);              /* 0.7.17: an order's pick in fight range -> same path as the scan */
+    if (ord) scan_note(ctx);
     if (cfg_down_on) {                                        /* downed (personage) target: no weapon is usable against it */
         const uint8_t *ti = *(const uint8_t *const *)(ctx + 0x10);
         const uint8_t *tg = ti ? *(const uint8_t *const *)(ti + 0x18) : NULL;
@@ -894,7 +1725,7 @@ __attribute__((used, ms_abi, noinline)) void *ms_hook(uint8_t *ctx)
             }
         }
     } else r = g_orig(ctx);
-    if (from_scan && cfg_charge && r) charge_note(ctx, ready != 0, d == MELEE);
+    if ((from_scan || ord) && cfg_charge && r) charge_note(ctx, ready != 0, d == MELEE);
     return r;
 }
 
@@ -973,7 +1804,7 @@ static int reload_cancel(uint8_t *u)
      * the inventory is busy, as 0.7.4 did (swaps worked), and only LOG what the record says (flags / start clock) for the next read. */
     const uint8_t *rb = w ? *(const uint8_t *const *)(w + 0xB0) : NULL;
     uint32_t rflags = rb ? rb[0x14] : 0, rstart = rb ? *(const uint32_t *)(rb + 0x10) : 0;
-    if (prm && n_keep && vec_has(prm + cfg_ammotags + TAGS_VEC, cfg_keep, n_keep) == 1) {
+    if (!g_rc_force && prm && n_keep && vec_has(prm + cfg_ammotags + TAGS_VEC, cfg_keep, n_keep) == 1) {
         st_rc_keep++;
         if (cfg_log && g_rclines < 40) { g_rclines++; logf_("reload: [%u ms] unit %p keeps its reload (held weapon has a KeepTags tag) (cancelled %u, kept %u)", now_ms(), (void *)u, st_rc_cancel, st_rc_keep); }
         return 0;
@@ -982,6 +1813,75 @@ static int reload_cancel(uint8_t *u)
     st_rc_cancel++;
     if (cfg_log && g_rclines < 40) { g_rclines++; logf_("reload: [%u ms] unit %p inventory ops cancelled before the melee draw (weapon reload record: flags 0x%02X start %u) (cancelled %u, kept %u)", now_ms(), (void *)u, rflags, rstart, st_rc_cancel, st_rc_keep); }
     return 1;
+}
+/* 0.7.26: name words of the weapon in hand (its stuff name Tags, like an ammo's): the take-item {item} words that bring it back */
+static int held_weapon_name(uint8_t *u, char *out, size_t cap)
+{
+    out[0] = 0;
+    if (!g_curweap || !u || !*(void **)(u + 0xDD8)) return 0;
+    const uint8_t *w = (const uint8_t *)g_curweap(*(void **)(u + 0xDD8));
+    const uint8_t *prm = w ? *(const uint8_t *const *)(w + 0x98) : NULL;
+    if (!prm || !readable(prm + cfg_namtags + TAGS_VEC, 16)) return 0;
+    vec_str(prm + cfg_namtags + TAGS_VEC, out, cap);
+    return out[0] != 0;
+}
+/* item tags for a weapon name, built once per name with the engine's TagContainer (as melee_tags) and kept for the session */
+#define NGUNTC 32
+static struct { char name[72]; uint8_t *tc; } g_guntc[NGUNTC];
+static int n_guntc;
+static void *gun_tags(const char *name)
+{
+    for (int i = 0; i < n_guntc; i++) if (!strcmp(g_guntc[i].name, name)) return g_guntc[i].tc;
+    if (n_guntc >= NGUNTC || !g_tcctor || !g_tcfromstr || !name[0]) return NULL;
+    uint8_t *tc = (uint8_t *)VirtualAlloc(NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!tc) return NULL;
+    snprintf(g_guntc[n_guntc].name, sizeof g_guntc[n_guntc].name, "%s", name);
+    const char *keep = g_guntc[n_guntc].name; size_t n = strlen(keep);
+    g_tcctor(tc);
+    __attribute__((aligned(16))) uint8_t str[0x20];                 /* MSVC std::string: inline up to 15 chars, else a pointer */
+    memset(str, 0, sizeof str);
+    if (n < 16) { memcpy(str, keep, n); *(uint64_t *)(str + 0x18) = 15; }
+    else { *(const char **)str = keep; *(uint64_t *)(str + 0x18) = n; }
+    *(uint64_t *)(str + 0x10) = n;
+    g_tcfromstr(tc, str, ' ');
+    char got[200]; vec_str(tc + TAGS_VEC, got, sizeof got);
+    if (cfg_log) logf_("ranged: item tags built for \"%s\": \"%s\"", keep, got);
+    g_guntc[n_guntc].tc = got[0] ? tc : NULL;
+    return g_guntc[n_guntc++].tc;
+}
+/* 0.7.26 back to the gun (Alex's 0.7.25 test: after the fight he ordered an attack on enemies 8-18 m away and the unit ran at
+ * them with the knife - an attack order uses whatever is in hand). A unit whose melee weapon the dll drew, not in melee
+ * stance, with nobody in fight range, gets a take-item order for the gun it held before: at once when it has an attack order
+ * on a far enemy (atk_tgt; that order is dropped so the take-item runs first, and given back when the knife is away), else
+ * HoldMs after the last enemy in range. 1 = ordered. */
+static int ranged_back(uint8_t *u, uint32_t now, uint8_t *atk_tgt)
+{
+    unit_t *s = unit_of(u, 0);
+    if (!s || !s->gun[0] || tag_stance(u)) return 0;
+    if (vec_has(u + cfg_enttags, g_ctagl, 1) != 1) {                             /* melee weapon not in hand */
+        if (!auto_active(u) && (uint32_t)(now - s->ad_draw_ms) > 5000) s->gun[0] = 0;   /* and no draw running: he is on a gun again */
+        return 0;
+    }
+    if (!atk_tgt && (uint32_t)(now - s->fr_ms) < cfg_ad_hold) return 0;         /* an enemy was in range a moment ago */
+    if (s->gun_ms && (uint32_t)(now - s->gun_ms) < 2500) return 0;              /* one order per swap */
+    st_gun_try++;
+    void *tags = g_takeitem ? gun_tags(s->gun) : NULL;
+    if (!tags) return 0;
+    s->gun_ms = now ? now : 1; s->ad_until = 0; s->auto_drawn = 0;
+    if (atk_tgt) { if (g_invcancel) g_invcancel(NULL, u); want_add_k(u, atk_tgt, now, 1); }
+    uint32_t params[2] = { 1, *g_ordstamp };
+    void *o = g_takeitem(tags), *ok = o ? g_addorder(u, o, params) : NULL;
+    if (ok) st_gun_draw++;
+    if (cfg_log && g_rblines < 60) { char qi[160]; g_rblines++; logf_("ranged: [%u ms] unit %p nobody in fight range%s: take-item order for \"%s\" %s | unit now has %s (re-draws %u)", now, (void *)u, atk_tgt ? " and an attack order on a far enemy" : "", s->gun, ok ? "added" : "REFUSED", queue_info(u, qi, sizeof qi), st_gun_draw); }
+    return ok != NULL;
+}
+/* 0.7.17: the weapon in hand carries a [ReloadCancel] KeepTags tag (heavy weapon) */
+static int holds_keep_weapon(uint8_t *u)
+{
+    if (!g_curweap || !n_keep || !u || !*(void **)(u + 0xDD8)) return 0;
+    const uint8_t *w = (const uint8_t *)g_curweap(*(void **)(u + 0xDD8));
+    const uint8_t *prm = w ? *(const uint8_t *const *)(w + 0x98) : NULL;
+    return prm && vec_has(prm + cfg_ammotags + TAGS_VEC, cfg_keep, n_keep) == 1;
 }
 
 static char cfg_drawbtn[TLEN] = "melee_toggle";
@@ -992,7 +1892,7 @@ static uint32_t g_epoch_last;
 static void log_epoch(uint32_t now)
 {
     if (g_epoch_last && now + 5000 < g_epoch_last) {
-        g_lines = g_clines = g_hlines = g_vlines = g_vreflines = g_adjlines = g_adlines = g_rclines = g_dlines = g_mlines = 0;
+        g_lines = g_clines = g_hlines = g_vlines = g_vreflines = g_adjlines = g_adlines = g_rclines = g_dlines = g_mlines = g_mdiag = g_seenlines = g_addiag = g_plines = g_skiplines = g_olines = g_rawlines = g_polllines = g_ovtlines = g_rblines = 0;
         if (cfg_log) logf_("--- clock %u -> %u: new mission, log line caps reset", g_epoch_last, now);
     }
     g_epoch_last = now;
@@ -1011,6 +1911,16 @@ static int is_draw_action(uint8_t *action)
     }
     return 0;
 }
+/* 0.7.19: 1 = the melee_toggle button applies to this unit (it carries a melee item), 0 = it does not, -1 = unknown (the action is
+ * only known after its first click in the session, or the CanApply slot was not found) */
+static int melee_by_button(const void *u)
+{
+    if (!g_draw_action || !g_off_canapply || !u) return -1;
+    void **vt = *(void ***)g_draw_action;
+    if (!vt) return -1;
+    canapply_t can = (canapply_t)vt[g_off_canapply / 8];
+    return can(g_draw_action, (void *)u, NULL) ? 1 : 0;
+}
 static int wants_draw(const uint8_t *u)
 {
     return u && (u[0x30] & 0x04) && vec_has(u + cfg_enttags, g_tagl, n_tagl) != 1 && vec_has(u + cfg_enttags, g_ctagl, 1) != 1;
@@ -1021,6 +1931,9 @@ static int draw_melee(uint8_t *action, void **vt, uint8_t *u)
 {
     (void)vt;
     if (!g_takeitem || !g_addorder || !u || is_linked(u)) return 0;
+    /* 0.7.26: a unit another dll is driving (SkipTags, e.g. mid jetpack jump): no draw now. The reload cancel below drops the
+     * unit's orders (CancelInventoryOps = brain vt+0x98, mask 0x707), which would kill the running jump order. */
+    if (n_skiptags && vec_has(u + cfg_enttags, cfg_skiptags, n_skiptags) == 1) return 0;
     uint32_t now = g_clock ? *g_clock : 0;
     last_t *l = now ? last_of(u, 1) : NULL;
     if (l && l->draw_ms && (uint32_t)(now - l->draw_ms) < cfg_draw_cd) { st_draw_wait++; return 0; }
@@ -1038,6 +1951,7 @@ static int draw_melee(uint8_t *action, void **vt, uint8_t *u)
 
 __attribute__((used, ms_abi)) void ms_exinst(uint8_t *action, void *list)
 {
+    if (!g_ui_tid) g_ui_tid = GetCurrentThreadId();           /* 0.7.22: the thread the engine runs button clicks on */
     if (!cfg_multi || !action || !list || !action[g_off_apply]) { g_exinst(action, list); return; }
     void **vt = *(void ***)action;
     int drawact = is_draw_action(action);
@@ -1663,6 +2577,12 @@ static void load_ini(const char *ini)
     cfg_skip_linked = GetPrivateProfileIntA("MeleeStance", "SkipLinked", 1, ini);
     cfg_lift_ready  = GetPrivateProfileIntA("MeleeStance", "DrawFromBelt", 1, ini);
     cfg_manual_skip = GetPrivateProfileIntA("MeleeStance", "SkipDirectControl", 1, ini);   /* 0.7.11 */
+    {   char sk[256]; GetPrivateProfileStringA("MeleeStance", "SkipTags", "tp_jetpack,hidden,melee_disabled,disable_melee,valkyrie,sensor_off", sk, sizeof sk, ini);   /* 0.7.17 */
+        n_skiptags = split_list(sk, cfg_skiptags, 8);
+        GetPrivateProfileStringA("MeleeStance", "IgnoreTargetTags", "hidden,melee_disabled,valkyrie,sensor_off", sk, sizeof sk, ini);   /* 0.7.28 */
+        n_tgttags = split_list(sk, cfg_tgttags, 8); }
+    cfg_order_on = GetPrivateProfileIntA("AutoDraw", "OrderPicks", 1, ini);                  /* 0.7.17 */
+    cfg_manual_diag = GetPrivateProfileIntA("MeleeStance", "DiagManual", 1, ini);          /* 0.7.14 */
     GetPrivateProfileStringA("MeleeStance", "Tag", "melee_stance", cfg_tag, sizeof cfg_tag, ini);
     GetPrivateProfileStringA("MeleeStance", "MeleeAmmoTags",
         "melee_light,melee_heavy,medium_inf_melee_target,medium_veh_melee_target,heavy_veh_melee_target", buf, sizeof buf, ini);
@@ -1671,6 +2591,11 @@ static void load_ini(const char *ini)
     GetPrivateProfileStringA("Charge", "Tag", "has_melee_weapon", cfg_ctag, sizeof cfg_ctag, ini);
     cfg_charge_inhand = GetPrivateProfileIntA("Charge", "MeleeInHand", 1, ini);
     cfg_charge_player = GetPrivateProfileIntA("Charge", "PlayerUnits", 1, ini);
+    cfg_zerg_on = GetPrivateProfileIntA("Zerg", "Enabled", 1, ini);                          /* 0.7.29 */
+    cfg_zerg_dist = (float)GetPrivateProfileIntA("Zerg", "Distance", 1600, ini);
+    cfg_zerg_reorder = GetPrivateProfileIntA("Zerg", "ReorderMs", 700, ini);
+    {   char zt[TLEN]; GetPrivateProfileStringA("Zerg", "Tag", "melee_infantry", zt, sizeof zt, ini);   /* 0.7.30 */
+        cfg_zerg_tag[0][0] = 0; split_list(zt, cfg_zerg_tag, 1); }
     cfg_charge_cd     = (uint32_t)GetPrivateProfileIntA("Charge", "CooldownMs", 4000, ini);
     cfg_retarget      = (uint32_t)GetPrivateProfileIntA("Charge", "RetargetMs", 1500, ini);
     cfg_refresh_ms    = (uint32_t)GetPrivateProfileIntA("Charge", "RefreshMs", 400, ini);
@@ -1716,6 +2641,24 @@ static void load_ini(const char *ini)
     GetPrivateProfileStringA("AutoDraw", "Distance", "100", buf, sizeof buf, ini);
     cfg_ad_dist = (float)atof(buf); if (cfg_ad_dist < 0.0f) cfg_ad_dist = 0.0f;
     GetPrivateProfileStringA("AutoDraw", "Item", "melee", cfg_ad_item, sizeof cfg_ad_item, ini);
+    cfg_probe_on   = GetPrivateProfileIntA("AutoDraw", "Probe", 1, ini);                       /* 0.7.16 */
+    cfg_probe_ms   = (uint32_t)GetPrivateProfileIntA("AutoDraw", "ProbeMs", 300, ini);
+    cfg_probe_cd   = (uint32_t)GetPrivateProfileIntA("AutoDraw", "ProbeCooldownMs", 4000, ini);
+    cfg_nomelee_ms = (uint32_t)GetPrivateProfileIntA("AutoDraw", "NoMeleeMs", 20000, ini);
+    cfg_probe_any  = GetPrivateProfileIntA("AutoDraw", "ProbeAnyRange", 1, ini);                /* 0.7.18 */
+    cfg_known_ms   = (uint32_t)GetPrivateProfileIntA("AutoDraw", "KnownMs", 300000, ini);
+    cfg_poll_on    = GetPrivateProfileIntA("AutoDraw", "OrderPoll", 1, ini);
+    cfg_poll_ms    = (uint32_t)GetPrivateProfileIntA("AutoDraw", "PollMs", 250, ini);
+    cfg_blind_ms   = (uint32_t)GetPrivateProfileIntA("AutoDraw", "BlindCheckMs", 8000, ini);      /* 0.7.19; 0.7.24: 8000 */
+    cfg_prox_on    = GetPrivateProfileIntA("AutoDraw", "Proximity", 1, ini);                        /* 0.7.24 */
+    cfg_esc_ms     = (uint32_t)GetPrivateProfileIntA("AutoDraw", "EscalateMs", 1500, ini);
+    { char lf[32]; GetPrivateProfileStringA("AutoDraw", "LeaveFactor", "1.5", lf, sizeof lf, ini); cfg_leave = (float)atof(lf); if (cfg_leave < 1.0f) cfg_leave = 1.0f; }   /* 0.7.27 */
+    cfg_tick_on    = GetPrivateProfileIntA("AutoDraw", "Tick", 1, ini);                             /* 0.7.22 */
+    cfg_tick_ms    = (uint32_t)GetPrivateProfileIntA("AutoDraw", "TickMs", 100, ini);
+    if (cfg_tick_ms < 20) cfg_tick_ms = 20;
+    cfg_fight_on   = GetPrivateProfileIntA("AutoDraw", "FightOrder", 1, ini);
+    cfg_fight_cd   = (uint32_t)GetPrivateProfileIntA("AutoDraw", "FightCooldownMs", 1500, ini);
+    if (!cfg_probe_ms) cfg_probe_ms = 1;
     cfg_veh_on     = GetPrivateProfileIntA("Vehicles", "Enabled", 1, ini);
     cfg_inf_ms     = (uint32_t)GetPrivateProfileIntA("Vehicles", "InfantryMs", 500, ini);
     GetPrivateProfileStringA("Vehicles", "InfantryRange", "400", buf, sizeof buf, ini);
@@ -1775,6 +2718,7 @@ static void install(void)
     if (s.charge_err && (cfg_ad_on || cfg_veh_on)) { cfg_ad_on = 0; logf_("  auto-draw OFF (needs the charge finders): %s", s.charge_err); }
     if (!s.charge_err) {                       /* engine pointers: charge, auto-draw and the vehicle rule share them */
         g_range = (range_t)s.range; g_scan_lo = s.scan_lo; g_scan_hi = s.scan_hi;
+        g_exe_lo = base;                                                            /* 0.7.17: caller RVAs in the order: log */
         g_mkatk = (mkatk_t)s.mkatk; g_addorder = (addord_t)s.addorder; g_setent = (setent_t)s.setent;
         g_mkmove = (mkmove_t)s.mkmove;
         g_fight = (fight_t)s.fight; g_mvchange = (mvchange_t)s.mvchange; g_uimove = (uimove_t)s.uimove;
@@ -1806,6 +2750,7 @@ static void install(void)
 
     char ml[600] = "";
     for (int i = 0; i < n_mtags; i++) { strcat(ml, cfg_mtags[i]); if (i + 1 < n_mtags) strcat(ml, ","); }
+    if (cfg_log) CreateThread(NULL, 0, hb_thread, NULL, 0, NULL);                  /* 0.7.21 */
     logf_("[GEM MeleeStance %s] installed: ammo match exe+0x%llX, ammo tags +0x%X, linked +0x%X bit %u (%d sites) | "
           "Tag=%s AlwaysTag=%s MeleeAmmoTags=%s SkipLinked=%d DrawFromBelt=%d Log=%d",
           MS_VERSION, (unsigned long long)(s.fn - base), cfg_ammotags, cfg_linkoff, cfg_linkbit, s.linksites,
@@ -1876,6 +2821,8 @@ static void install(void)
     if (cfg_ad_on) logf_("  auto-draw ON: Distance=%.0f HoldMs=%u PlayerUnits=%d Item=%s | TagContainer ctor exe+0x%llX FromString exe+0x%llX",
                          cfg_ad_dist, cfg_ad_hold, cfg_ad_player, cfg_ad_item,
                          (unsigned long long)(s.tcctor ? s.tcctor - base : 0), (unsigned long long)(s.tcfromstr ? s.tcfromstr - base : 0));
+    if (cfg_ad_on) logf_("  fight range (0.7.16): Probe=%d ProbeMs=%u ProbeCooldownMs=%u NoMeleeMs=%u | FightOrder=%d FightCooldownMs=%u (eFight vt %s)",
+                         cfg_probe_on, cfg_probe_ms, cfg_probe_cd, cfg_nomelee_ms, cfg_fight_on, cfg_fight_cd, s.vt_fight ? "found" : "NOT found: no 'already fighting' test");
     g_vt_attack = s.vt_attack; g_vt_attackb = s.vt_attackb; g_vt_fight = s.vt_fight;
     if (cfg_veh_on && !s.vt_attack && !s.vt_fight) logf_("  vehicles: order vtables not found, player attack orders on vehicles are not recognised");
     if (cfg_veh_on) logf_("  vehicles ON: stance units melee vehicles with %s ammo, infantry first (InfantryMs=%u within InfantryRange=%.0f, crews excluded), close order %s from CloseDistance=%.0f, "
@@ -2064,6 +3011,8 @@ int main(int argc, char **argv)
     };
     int fails = 0;
     cfg_charge = 0;
+    cfg_probe_on = 0; cfg_fight_on = 0;                       /* 0.7.16 rules: own block at the end; the older cases test the old paths */
+    cfg_known_ms = 0; cfg_poll_on = 0;                        /* 0.7.18: same (the old cases expect the 20 s melee memory) */
     for (size_t i = 0; i < sizeof c / sizeof c[0]; i++) {
         uint8_t ctx[0x20] = { 0 };
         *(void **)ctx = c[i].a->obj; *(void **)(ctx + 8) = c[i].u->obj;
@@ -2286,6 +3235,159 @@ int main(int argc, char **argv)
         cfg_rc_on = 0; int r5 = reload_cancel(gunner.obj) == 0 && f_cancels == 3; cfg_rc_on = 1;
         int ok = r1 && r2 && r3 && r3b && r4 && r5;
         printf("reload cancel: idle %d heavy-kept %d bolter-cancelled %d busy-no-record %d empty-hand %d disabled %d -> %s\n", r1, r2, r3, r3b, r4, r5, ok ? "OK" : "FAIL");
+        if (!ok) fails++;
+    }
+    /* 0.7.16 probe + fight order */
+    {
+        g_ismanual = NULL; g_mgr = NULL; cfg_probe_on = 1; cfg_fight_on = 1; cfg_charge = 1;
+        g_takeitem = (takeitem_t)(void *)f_nop;
+        static fake_t kn, gn, ft; static uint8_t tp[0x40], fbrain[0x400], forder[0x100]; static void *fblk[2], *fmap[1];
+        memset(&kn, 0, sizeof kn); kn.obj[0x30] = 6; fake_vec(kn.obj + cfg_enttags, kn.tags, "faction_sm", NULL, NULL);
+        memset(&gn, 0, sizeof gn); gn.obj[0x30] = 6; fake_vec(gn.obj + cfg_enttags, gn.tags, "faction_ig", NULL, NULL);
+        memset(tp, 0, sizeof tp); *(void **)(tp + 0x18) = enemy.obj; *(float *)(tp + 0x28) = 80.0f;   /* enemy 80 units out: fight range */
+        uint8_t ck[0x20] = { 0 }, cn[0x20] = { 0 };
+        *(void **)ck = bolter.obj; *(void **)(ck + 8) = kn.obj; *(void **)(ck + 0x10) = tp;
+        *(void **)cn = bolter.obj; *(void **)(cn + 8) = gn.obj; *(void **)(cn + 0x10) = tp;
+        f_clock += 100000;
+        uint32_t s0 = st_probe;
+        int p0 = ms_decide(ck) == PASS;                                                /* no probe yet: gun passes */
+        scan_note(ck); int p1 = st_probe == s0 + 1;                                     /* enemy close, no melee seen -> probe */
+        int p2 = ms_decide(ck) == REJECT;                                               /* bolter refused during the probe */
+        *(void **)ck = sword.obj; int p3 = ms_decide(ck) == MELEE && carries_melee(kn.obj) && st_probe_ok == 1;   /* knife offered -> found */
+        *(void **)ck = bolter.obj; scan_note(ck); int p4 = st_probe == s0 + 1;         /* carries melee now: no new probe (auto-draw hold) */
+        scan_note(cn); int p5 = st_probe == s0 + 2;                                     /* the lasgunner: probe */
+        int p6 = ms_decide(cn) == REJECT;
+        f_clock += cfg_probe_ms; scan_note(cn); int p7 = st_probe_fail == 1;           /* only guns offered -> no melee */
+        int p8 = ms_decide(cn) == PASS;                                                 /* keeps his gun */
+        f_clock += cfg_probe_cd + 1; scan_note(cn); int p9 = st_probe == s0 + 2;       /* NoMeleeMs: no new probe */
+        f_clock += cfg_nomelee_ms; scan_note(cn); int p10 = st_probe == s0 + 3;        /* after NoMeleeMs: probes again */
+        /* fight order: knife in hand, enemy at 40 (in reach, under MinDistance) -> eFight queued */
+        memset(&ft, 0, sizeof ft); ft.obj[0x30] = 6; fake_vec(ft.obj + cfg_enttags, ft.tags, "faction_sm", "has_melee_weapon", NULL);
+        *(float *)(tp + 0x28) = 40.0f;
+        uint8_t cf2[0x20] = { 0 }; *(void **)cf2 = sword.obj; *(void **)(cf2 + 8) = ft.obj; *(void **)(cf2 + 0x10) = tp;
+        uint32_t fq0 = st_fight_q, cq0 = st_charge_q;
+        charge_note(cf2, 1, 0); int f1 = st_fight_q == fq0 + 1 && st_charge_q == cq0 + 1;
+        int o0 = f_orders; f_clock += 50; charge_flush(man.obj); int f2 = f_orders > o0;   /* order issued */
+        charge_note(cf2, 1, 0); int f3 = st_fight_q == fq0 + 1;                        /* inside FightCooldownMs: nothing */
+        g_vt_fight = (void **)0x8888;                                                   /* engine runs eFight on this enemy */
+        *(void **)forder = (void *)0x8888; *(uint32_t *)(forder + 0x48) = 1; *(void **)(forder + 0x58) = enemy.obj;
+        fblk[0] = forder; fmap[0] = fblk;
+        *(uint32_t *)(fbrain + 0x39C) = 0x1000; *(int32_t *)(fbrain + 0x88) = 1;
+        *(void **)(fbrain + 0x70) = fmap; *(uint64_t *)(fbrain + 0x78) = 1; *(uint64_t *)(fbrain + 0x80) = 0;
+        *(uint8_t **)(ft.obj + 0xDC8) = fbrain;
+        f_clock += cfg_fight_cd + 1; charge_note(cf2, 1, 0); int f4 = st_fight_q == fq0 + 1;   /* already fighting it: nothing */
+        *(void **)(forder + 0x58) = man.obj;                                            /* fighting someone else (dll order) */
+        mine_add(forder);
+        charge_note(cf2, 1, 0); int f5 = st_fight_q == fq0 + 2;                        /* -> eFight on this one */
+        g_vt_fight = NULL; *(uint8_t **)(ft.obj + 0xDC8) = NULL;
+        cfg_fight_on = 0; *(float *)(tp + 0x28) = 40.0f; f_clock += 10000;
+        uint32_t cq1 = st_charge_q; charge_note(cf2, 1, 0); int f6 = st_charge_q == cq1;   /* FightOrder=0: old rule, nothing in reach */
+        cfg_fight_on = 1;
+        /* 0.7.17 order picks: the hook called from outside the scan (g_scan_lo unset here = every call is "outside") */
+        static fake_t ou, jp; static uint8_t to[0x40];
+        memset(&ou, 0, sizeof ou); ou.obj[0x30] = 6; fake_vec(ou.obj + cfg_enttags, ou.tags, "faction_sm", NULL, NULL);
+        memset(&jp, 0, sizeof jp); jp.obj[0x30] = 6; fake_vec(jp.obj + cfg_enttags, jp.tags, "faction_sm", "tp_jetpack", NULL);
+        memset(to, 0, sizeof to); *(void **)(to + 0x18) = enemy.obj; *(float *)(to + 0x28) = 40.0f;
+        uint8_t co[0x20] = { 0 }; *(void **)co = bolter.obj; *(void **)(co + 8) = ou.obj; *(void **)(co + 0x10) = to;
+        f_clock += 100000; uint32_t s1 = st_probe, fq1 = st_fight_q;
+        int o1 = ms_hook(co) == NULL && st_probe == s1 + 1;                              /* order pick at 40: probe, bolter refused */
+        *(void **)co = sword.obj;
+        int o2 = ms_hook(co) != NULL && st_fight_q == fq1 + 1;                           /* knife offered: melee + fight order queued */
+        *(void **)co = bolter.obj; *(void **)(co + 8) = jp.obj;
+        int o3 = ms_hook(co) != NULL && st_probe == s1 + 1;                              /* tp_jetpack: left alone, gun passes, no probe */
+        *(float *)(to + 0x28) = 300.0f; *(void **)(co + 8) = ou.obj; f_clock += 10000;
+        int o4 = ms_hook(co) != NULL;                                                    /* order pick at 300: engine's choice (knife seen, no hold) */
+        /* 0.7.18 order poll: units with an explicit attack order run no scan; the dll checks their front order itself */
+        cfg_known_ms = 300000; cfg_poll_on = 1; cfg_prox_on = 0; cfg_esc_ms = 0;
+        static fake_t pa, pb, pc; static uint8_t pbrain[3][0x400], pord[3][0x100]; static void *pblk[3][2], *pmap[3][1];
+        fake_t *pu[3] = { &pa, &pb, &pc };
+        memset(&pa, 0, sizeof pa); pa.obj[0x30] = 6; fake_vec(pa.obj + cfg_enttags, pa.tags, "faction_sm", "has_melee_weapon", NULL);   /* knife in hand */
+        memset(&pb, 0, sizeof pb); pb.obj[0x30] = 6; fake_vec(pb.obj + cfg_enttags, pb.tags, "faction_sm", NULL, NULL);                 /* knife on the belt, known */
+        memset(&pc, 0, sizeof pc); pc.obj[0x30] = 6; fake_vec(pc.obj + cfg_enttags, pc.tags, "faction_ig", NULL, NULL);                 /* unknown */
+        g_vt_attack = (void **)0x7777;
+        *(float *)(enemy.obj + 0x74) = 40.0f;                                            /* enemy 40 units east of the origin */
+        for (int i = 0; i < 3; i++) {
+            *(void **)pord[i] = (void *)0x7777; *(uint32_t *)(pord[i] + 0x48) = 1; *(void **)(pord[i] + 0x58) = enemy.obj;
+            pblk[i][0] = pord[i]; pmap[i][0] = pblk[i];
+            *(uint32_t *)(pbrain[i] + 0x39C) = 0x1000; *(int32_t *)(pbrain[i] + 0x88) = 1;
+            *(void **)(pbrain[i] + 0x70) = pmap[i]; *(uint64_t *)(pbrain[i] + 0x78) = 1; *(uint64_t *)(pbrain[i] + 0x80) = 0;
+            *(uint8_t **)(pu[i]->obj + 0xDC8) = pbrain[i];
+        }
+        f_clock += 100000;
+        melee_known(pb.obj);
+        for (int i = 0; i < 3; i++) known_note(pu[i]->obj, f_clock);
+        uint32_t pf0 = st_poll_fight, pd0 = st_poll_draw, pn0 = st_poll_unknown;
+        order_poll(man.obj, f_clock);
+        /* 0.7.19: pc (unknown) gets the blind draw: draws = known (pb) + blind (pc) */
+        int q1 = st_poll_fight == pf0 + 1, q2 = st_poll_draw == pd0 + 2, q3 = st_poll_unknown == pn0 + 1 && unit_of(pc.obj, 0)->blind_ms;
+        order_poll(man.obj, f_clock + 10);                                               /* inside PollMs: nothing */
+        int q4 = st_poll_fight == pf0 + 1 && st_poll_draw == pd0 + 2;
+        order_poll(man.obj, f_clock + cfg_blind_ms + 1);                                 /* blind draw judged: nothing in hand -> no melee */
+        unit_t *bs = unit_of(pc.obj, 0);
+        int q6 = bs && !bs->blind_ms && bs->nomelee_until && !has_melee(pc.obj);
+        *(float *)(enemy.obj + 0x74) = 300.0f;                                           /* enemy out of fight range */
+        order_poll(man.obj, f_clock + cfg_blind_ms + 1000);
+        int q5 = st_poll_draw == pd0 + 2;
+        /* 0.7.22: the dll's own tick (no hook call needed) + the wanted fight: pb's knife comes into his hand -> fight order */
+        *(float *)(enemy.obj + 0x74) = 40.0f;
+        fake_vec(pb.obj + cfg_enttags, pb.tags, "faction_sm", "has_melee_weapon", NULL);
+        f_clock += cfg_blind_ms + 4000; g_sim_tid = GetCurrentThreadId(); g_tick_wall = 0;   /* 4 s after the last poll's want refresh */
+        LONG tk0 = st_ticks; uint32_t wf0 = st_want_fight, cq9 = st_charge_q;
+        ms_tick();
+        int t1 = st_ticks == tk0 + 1 && st_want_fight == wf0 + 1 && st_charge_q > cq9;
+        g_tick_wall = 0; ms_tick();                                                      /* clock did not advance: no second tick */
+        int t2 = st_ticks == tk0 + 1;
+        g_sim_tid = GetCurrentThreadId() + 1; f_clock += 500; g_tick_wall = 0; ms_tick(); /* not the engine's thread: nothing */
+        int t3 = st_ticks == tk0 + 1 && st_tick_wrongthread == 1;
+        g_sim_tid = 0;
+        printf("own tick: tick+wanted fight %d paused %d wrong thread %d\n", t1, t2, t3);
+        if (!(t1 && t2 && t3)) q1 = 0;
+        /* 0.7.24 fight-range stance: an idle unit with a knife on the belt and a known hostile at 40 -> draw + wanted fight; a
+         * friend at 40 does nothing; knife still not in hand after EscalateMs -> fight order anyway */
+        {
+            static fake_t px, py; cfg_prox_on = 1; cfg_esc_ms = 1500;
+            memset(&px, 0, sizeof px); px.obj[0x30] = 6; fake_vec(px.obj + cfg_enttags, px.tags, "faction_sm", NULL, NULL);
+            memset(&py, 0, sizeof py); py.obj[0x30] = 6; py.obj[0xDA8] = 7; fake_vec(py.obj + cfg_enttags, py.tags, "faction_ig", NULL, NULL);
+            *(float *)(py.obj + 0x78) = 2000.0f;                                         /* owner 7, far from everyone, hostile to nobody */
+            *(float *)(px.obj + 0x78) = 30.0f;                                           /* px: 30 north of the origin, enemy 40 east of it = 50 away */
+            f_clock += 20000; known_note(px.obj, f_clock); known_note(py.obj, f_clock); known_note(enemy.obj, f_clock); melee_known(px.obj);
+            int w0 = 0, w1 = 0, wy = 0;
+            for (int i = 0; i < NWANT; i++) if (g_want[i].used && g_want[i].unit == px.obj) w0 = 1;
+            g_poll_last = 0; order_poll(NULL, f_clock);
+            for (int i = 0; i < NWANT; i++) { if (g_want[i].used && g_want[i].unit == px.obj && g_want[i].tgt == enemy.obj) w1 = 1; if (g_want[i].used && g_want[i].unit == py.obj) wy = 1; }
+            uint32_t e0 = st_want_esc; g_poll_last = 0; order_poll(NULL, f_clock + 1600);
+            int x3 = 0;                                                                  /* (the enemy, idle with px in his range, escalates too) */
+            for (int i = 0; i < NWANT; i++) if (g_want[i].used && g_want[i].unit == px.obj && g_want[i].esc) x3 = st_want_esc > e0;
+            printf("fight-range stance: draw+want %d friend-ignored %d escalated %d\n", !w0 && w1, !wy, x3);
+            if (w0 || !w1 || wy || !x3) q1 = 0;
+            /* 0.7.26: knife in hand from the dll, nobody in fight range for HoldMs -> the gun is asked for; melee stance: never */
+            static fake_t pg; memset(&pg, 0, sizeof pg); pg.obj[0x30] = 6; fake_vec(pg.obj + cfg_enttags, pg.tags, "faction_sm", "has_melee_weapon", NULL);
+            *(float *)(pg.obj + 0x78) = -3000.0f;                                        /* far from everyone */
+            known_note(pg.obj, f_clock); unit_t *gs = unit_of(pg.obj, 1); snprintf(gs->gun, sizeof gs->gun, "sm_bolter"); gs->fr_ms = f_clock;
+            uint32_t g0 = st_gun_try; g_poll_last = 0; order_poll(NULL, f_clock + 100);
+            int y1 = st_gun_try == g0;                                                   /* an enemy was in range 100 ms ago: not yet */
+            g_poll_last = 0; order_poll(NULL, f_clock + cfg_ad_hold + 200);
+            int y2 = st_gun_try == g0 + 1;
+            f_clock += 90000; unit_t *gs2 = unit_of(pg.obj, 0);
+            int y3 = gs2 == gs && !strcmp(gs2->gun, "sm_bolter");                        /* state survives a quiet minute and a half */
+            /* 0.7.27: knife in hand from the dll, enemy at 130 (beyond Distance 100, inside x1.5): stays in melee, no gun yet */
+            *(float *)(pg.obj + 0x74) = *(float *)(enemy.obj + 0x74); *(float *)(pg.obj + 0x78) = 130.0f;
+            uint32_t g1 = st_gun_try; int y4 = 0; g_poll_last = 0; order_poll(NULL, f_clock);
+            for (int i = 0; i < NPEND; i++) if (g_pend[i].used && g_pend[i].unit == pg.obj) y4 = st_gun_try == g1;
+            *(float *)(pg.obj + 0x78) = 170.0f; f_clock += 10000; g_poll_last = 0; order_poll(NULL, f_clock);   /* at 170: out, the gun is asked for */
+            int y5 = st_gun_try == g1 + 1;
+            printf("back to the gun: held %d asked %d state kept %d | range edge: stays at 130 %d leaves at 170 %d\n", y1, y2, y3, y4, y5);
+            if (!(y1 && y2 && y3 && y4 && y5)) q1 = 0;
+            cfg_prox_on = 0; cfg_esc_ms = 0;
+        }
+        *(float *)(enemy.obj + 0x74) = 0.0f; g_vt_attack = NULL;
+        for (int i = 0; i < 3; i++) *(uint8_t **)(pu[i]->obj + 0xDC8) = NULL;
+        printf("order poll: fight %d draw %d blind %d interval %d far %d blind-judged %d\n", q1, q2, q3, q4, q5, q6);
+        int ok = p0 && p1 && p2 && p3 && p4 && p5 && p6 && p7 && p8 && p9 && p10 && f1 && f2 && f3 && f4 && f5 && f6 && o1 && o2 && o3 && o4
+              && q1 && q2 && q3 && q4 && q5 && q6;
+        printf("order picks: probe %d melee+fight %d jetpack-skip %d far %d\n", o1, o2, o3, o4);
+        printf("fight range: no-probe %d probe %d gun-refused %d melee-found %d no-reprobe %d probe2 %d refused2 %d none %d gun-kept %d no-melee-wait %d reprobe %d | fight queued %d ordered %d cooldown %d running %d other %d off %d -> %s\n",
+               p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, f1, f2, f3, f4, f5, f6, ok ? "OK" : "FAIL");
         if (!ok) fails++;
     }
     printf("filter: %zu cases + 3 hook cases + charge, %d failed\n", sizeof c / sizeof c[0], fails);

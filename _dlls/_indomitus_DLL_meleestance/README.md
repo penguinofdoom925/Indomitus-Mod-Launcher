@@ -1,4 +1,37 @@
-# GEM MeleeStance 0.7.13
+# GEM MeleeStance 0.7.30
+
+## 0.7.19 - 0.7.30 (Nov 9 2026, short form; full notes in the comments of src\gem_meleestance.c and in the ini)
+- 0.7.19-0.7.23: the dll runs its own tick at the start of every simulation quant (`Scene::eQuantExecutor` slot hook), because
+  a unit under an explicit attack order never reaches the MatchAmmo hook. Order events come from GEM Teleport's
+  `gem_order_listen` export (0.2.3+). "Carries melee" is asked from the toggle button's own CanApply.
+- 0.7.24-0.7.27: fight-range stance. A unit that is idle or on an attack order with an enemy human inside `[AutoDraw] Distance`
+  draws its melee weapon and gets the fight order; it takes its gun back once the enemy is beyond Distance x `LeaveFactor`.
+  Export `gem_quant_listen(cb)` for other payload dlls.
+- 0.7.28: units tagged `hidden` / `melee_disabled` / `disable_melee` / `valkyrie` / `sensor_off` are left alone
+  (`SkipTags`) and are no targets for the dll (`IgnoreTargetTags`).
+- 0.7.29-0.7.30: `[Zerg]`: an AI-owned human with breed tag `melee_infantry` holding its melee weapon charges enemy
+  infantry within 80 m and gets the order again when the bot's Lua replaces it. Replaces the `melee_inf_atk` mission triggers.
+
+## 0.7.18 (Nov 9 2026: attack orders in fight range)
+Alex's 0.7.17 test: right-click attack within 5 m still punched with the bolter and the log had no `order:` line - under an
+explicit attack order the engine neither scans nor re-picks the weapon through MatchAmmo. Now:
+- Order poll (`[AutoDraw] OrderPoll`, `PollMs` 250): every human that ran a scan is remembered (256 weak refs, least recently
+  seen replaced). From another unit's scan, each remembered unit whose front order is an explicit eAttack / eAttackBasic (not
+  a dll order) on enemy infantry inside Distance: melee in hand -> eFight queued; known to carry melee -> take-item draw queued
+  and guns held (the scan path gives the fight order once it is in hand); unknown -> left alone. Log `poll:`.
+- Long melee memory: `has_melee` = offered in the last 20 s or within `KnownMs` (300000) of any melee offer.
+- Probe at any range (`ProbeAnyRange`): once per unit on the first scanned enemy; a far probe refuses that one pick and only
+  learns the answer (no weapon swap). `NoMeleeMs` 120000.
+- `raw:` log = the first 40 hook calls from outside the scan, unfiltered (caller RVA, unit, target).
+
+## 0.7.17 (Nov 9 2026)
+- Order picks: Alex's 0.7.16 snapshot showed a unit under a right-click attack order punching with its bolter within 5 m; the
+  engine runs no enemy scan for a unit with an explicit order, and the fight-range rules ran only from the scan. Weapon picks
+  from anywhere else (`order_pick`) now take the same path when the enemy is infantry inside `[AutoDraw] Distance`:
+  `order_goes_melee` decides (now always 1, Alex: melee whenever possible, ordered or AI, heavy weapons too). `[AutoDraw]
+  OrderPicks=0` turns it off. Log `order:` per new (unit, enemy) with the caller RVA.
+- `[MeleeStance] SkipTags` (tp_jetpack): units another dll drives are left alone like direct control (teleport jump: its
+  GiveOrder lock refuses every order, so draws / fight orders would only be refused).
 
 Dawn of War style melee toggle + melee charge for Call to Arms: Gates of Hell 1.067 (game, editor, server).
 
@@ -166,6 +199,33 @@ run is now re-aimed when the enemy moved `MoveRefreshUnits` (40) OR `[Charge] Mo
 whichever is larger (500 units off: 200, about 2 s of a running enemy; inside CloseDistance the attack order as before). Log line
 caps (charge 200, held 200, 40 for the rest) restart on every mission (sim clock going backwards): the first mission of that run had
 used them all and the melee-mode test after it left no lines.
+
+## 0.7.14 (Nov 8 2026, diagnostic; Alex: after leaving direct control the unit "still acted like I was in it")
+The 0.7.13 editor log only ever had `property 1, manager 0`, even while driving: the manager test never matched, and the
+`IsManualControlled` property (inferred) stays set after the player leaves direct control, so the unit stayed skipped. No behaviour
+change in 0.7.14: `[MeleeStance] DiagManual=1` logs (`mdiag:`, 300 lines per mission) every change of the four inputs on a human
+player's units: DE0 property value (+0x18), DD8 +0x70 bit 1, `IsManualControlled`, manager +0x3B0 == unit. When IsManualControlled
+is on and the manager does not name the unit, the manager object's first 0x1000 bytes are searched for the unit pointer and the
+offsets logged (the right getter offset for the real fix: skip only while the player is driving the unit).
+
+## 0.7.15 (Nov 8 2026, diagnostic; Alex: Sternguard in ranged stance punched in fight range, never drew his knife)
+The 0.7.14 log had no auto-draw line and no melee decision for that unit. Auto-draw only arms a unit the engine offered melee ammo
+to within the last 20 s (`carries_melee`). New lines: `seen:` = first melee-ammo offer per unit (60 per mission), `adiag:` = every
+change of (offered recently, in hand, player unit, stance, decision) while enemy infantry is inside `[AutoDraw] Distance` (100).
+
+## 0.7.16 (Nov 9 2026: fight range = melee + fight order)
+Alex's Nov 8 session dump: the melee-offered table (`g_seen`) held one unit for the whole session, and only after its knife was in
+hand. `ammo.set` is first-match, the gun rows sit above the melee rows, so the engine never offers a belt melee weapon to a unit
+holding a gun and the auto-draw never armed (the old comment "any scan lists every carried item, belt included" was wrong).
+Moving the melee rows up was rejected (units would pull melee instead of guns).
+- `[AutoDraw] Probe` (1): enemy infantry inside Distance and no melee seen on the unit -> its gun ammo is refused for one weapon
+  pick (`ProbeMs` 300), so the engine reaches the melee rows. Melee offered -> auto-draw as before (`probe: ... melee found`);
+  only guns -> no melee weapon, guns kept for `NoMeleeMs` (60000) (`probe: ... no melee weapon`). One probe per unit per
+  `ProbeCooldownMs` (4000). Stance units and units with melee in hand are not probed.
+- `[AutoDraw] FightOrder` (1): inside Distance a melee unit (weapon in hand, or stance = drawn first) gets the attack_melee order
+  (eFight) on the enemy, in reach too (before: no order in reach / under MinDistance, so the engine's own blows = punches with
+  the gun). Not re-issued while eFight runs on that enemy, within `FightCooldownMs` (1500), or over a player order on another
+  enemy. Vehicles keep the old rules.
 
 ## Files
 - `gem_meleestance.dll` - plain dll, hooks in DllMain (inject before the engine runs, or into a running game for tests)
