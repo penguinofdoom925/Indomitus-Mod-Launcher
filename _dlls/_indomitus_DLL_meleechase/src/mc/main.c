@@ -36,6 +36,9 @@ static void init(HMODULE self)
     g_meleeTag[sizeof g_meleeTag - 1] = 0;
     g_meleeTagLen = strlen(g_meleeTag);
     if (!g_meleeTagLen) { logf_("melee_tag is empty - nothing to do"); return; }
+    ini_str("vehicle_melee_tag", "veh_melee", g_meleeTag2, sizeof g_meleeTag2);   /* 0.5.1; empty = off */
+    g_meleeTag2[sizeof g_meleeTag2 - 1] = 0;
+    g_meleeTag2Len = strlen(g_meleeTag2);
     int wantVehicle = ini_int("vehicle_chase", 1);       /* 0.5.0: human_fight_distance / fight_distance_mult are gone (ignored if still in an ini) */
     g_repathMin = ini_float("repath_min_m", 1.0f, 0.2f, 100.0f) * WORLD_SCALE;
     g_repathMax = ini_float("repath_max_m", 10.0f, 0.2f, 500.0f) * WORLD_SCALE;
@@ -66,6 +69,7 @@ static void init(HMODULE self)
     g_okWeapons = find_weapon_layout();
     if (!g_okWeapons) { logf_("melee weapon test               OFF (engine code not recognised) - nothing to do"); return; }
     logf_("melee weapon = weapon whose item carries the tag \"%s\"", g_meleeTag);
+    if (g_meleeTag2Len) logf_("                or the vehicle weapon tag \"%s\"", g_meleeTag2);
 
     /* 0.5.0: humans are not touched (infantry melee = GEM MeleeStance); nothing is hooked on human states */
     logf_("humans                         not touched (0.5.0: fight distance multiplier removed, infantry melee = GEM MeleeStance)");

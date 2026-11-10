@@ -16,7 +16,7 @@ if not defined CCX (python -c "import ziglang" >nul 2>&1 && set CCX=python -m zi
 if not defined CCX (echo ERROR: no zig found & exit /b 1)
 set CCX=%CCX% -target x86_64-windows-gnu -mcpu=baseline -O2
 
-%CCX% -shared -s -o dist\gem_sessiondump.dll src\gem_sessiondump.c || exit /b 1
+%CCX% -shared -s -o dist\gem_sessiondump.dll src\gem_sessiondump.c -ladvapi32 || exit /b 1
 copy /y src\gem_sessiondump.ini dist\ >nul
 del dist\*.lib dist\*.pdb >nul 2>&1
 echo built dist\gem_sessiondump.dll

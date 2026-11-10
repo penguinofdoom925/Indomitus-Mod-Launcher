@@ -1125,16 +1125,28 @@ static void WriteSessionLog(DWORD exitCode, const wchar_t* how)
     std::vector<std::string> index;
     bool havePayload = !g_cfg.payloadDir.empty();   // DEV builds have none
     SessionAddFile(body, index, L"launcher", g_dir + L"\\gem_launcher.log");
-    std::wstring gameLogs = local + L"\\digitalmindsoft\\gates of hell";
-    SessionAddFile(body, index, L"game: game.log", gameLogs + L"\\log\\game.log");
+    // the game config root is Documents\my games\gates of hell on some PCs and
+    // %LocalAppData%\digitalmindsoft\gates of hell on others (the other can hold a stale copy;
+    // SessionAddFile and the dump scan only take files written since the start, so search both)
+    std::vector<std::wstring> gameRoots;
+    {
+        wchar_t p[MAX_PATH];
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, p)))
+            gameRoots.push_back(std::wstring(p) + L"\\my games\\gates of hell");
+        gameRoots.push_back(local + L"\\digitalmindsoft\\gates of hell");
+    }
+    for (const auto& gameLogs : gameRoots)
+        SessionAddFile(body, index, L"game: game.log", gameLogs + L"\\log\\game.log");
     if (havePayload) for (const auto& f : ListFiles(g_cfg.payloadDir, L"*.log")) SessionAddFile(body, index, L"dll: " + f, g_cfg.payloadDir + L"\\" + f);
     if (havePayload) for (const auto& sd : ListFiles(g_cfg.payloadDir, L"server*", true)) {
         std::wstring d = g_cfg.payloadDir + L"\\" + sd;
         for (const auto& f : ListFiles(d, L"*.log")) SessionAddFile(body, index, L"host server dll: " + sd + L"\\" + f, d + L"\\" + f);
     }
-    SessionAddFile(body, index, L"host server: game.log", gameLogs + L"\\log_ds\\game.log");
+    for (const auto& gameLogs : gameRoots)
+        SessionAddFile(body, index, L"host server: game.log", gameLogs + L"\\log_ds\\game.log");
 
     std::string dumps;
+    for (const auto& gameLogs : gameRoots)
     for (const wchar_t* sub : {L"log", L"log_ds"}) {
         std::wstring d = gameLogs + L"\\" + sub + L"\\minidumps";
         WIN32_FIND_DATAW fd;

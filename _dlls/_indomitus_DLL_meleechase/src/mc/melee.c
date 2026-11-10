@@ -94,6 +94,9 @@ static float g_holdFactor = 1.0f;
 
 /* settings */
 static char  g_meleeTag[48] = "melee"; static size_t g_meleeTagLen = 5;
+/* 0.5.1: second melee word for vehicle weapons. The engine gives the word "melee" a meaning of its own on weapons (it applies
+   the human Melee skill; a "pattern gun" vehicle weapon tagged melee crashed the server at spawn), so vehicle guns carry this one */
+static char  g_meleeTag2[48] = "veh_melee"; static size_t g_meleeTag2Len = 9;
 /* re-plan threshold = clamp(distance x fraction, min, max); checks every repathMs, or repathMsClose within closeRange */
 static float g_repathFrac = 0.25f, g_repathMin = 1.0f * WORLD_SCALE, g_repathMax = 10.0f * WORLD_SCALE;
 static uint32_t g_repathMs = 500, g_repathMsClose = 200;
@@ -119,7 +122,7 @@ static uint8_t *rel32_target(uint8_t *insn, int len) { return insn + len + rd_u3
 /* Tags are interned: two Tags are equal when their first qword (the id) is equal (the engine's Tag== at exe+0x556810).
    The ids of the melee tag and the two priority props are built once, lazily on the first engine call that needs them
    (engine thread, after CRT init), with the engine's Tag(const char*) ctor. Until then / without the ctor: name compare. */
-static uint64_t g_idMelee, g_idPropMelee, g_idPropRanged;
+static uint64_t g_idMelee, g_idMelee2, g_idPropMelee, g_idPropRanged;
 static volatile LONG g_idState;                                         /* 0 none, 1 building, 2 ready, 3 unavailable */
 static TagCtorCStrFn g_tagCtorForIds;                                   /* set by find_weapons (Tag::Tag(const char*)) */
 static int ids_ready(void)
@@ -131,10 +134,11 @@ static int ids_ready(void)
     if (g_idState != 0) return 0;
     if (InterlockedCompareExchange(&g_idState, 1, 0) != 0) return 0;
     if (!g_tagCtorForIds) { g_idState = 3; return 0; }
-    static uint8_t buf[3][TAG_SIZE * 2] __attribute__((aligned(16)));   /* never freed */
-    const char *names[3] = { g_meleeTag, g_propMelee, g_propRanged };
-    uint64_t *ids[3] = { &g_idMelee, &g_idPropMelee, &g_idPropRanged };
-    for (int i = 0; i < 3; i++) {
+    static uint8_t buf[4][TAG_SIZE * 2] __attribute__((aligned(16)));   /* never freed */
+    const char *names[4] = { g_meleeTag, g_propMelee, g_propRanged, g_meleeTag2 };
+    uint64_t *ids[4] = { &g_idMelee, &g_idPropMelee, &g_idPropRanged, &g_idMelee2 };
+    for (int i = 0; i < 4; i++) {
+        if (!names[i][0]) { *ids[i] = 0; continue; }                       /* second melee word switched off */
         char low[48]; size_t k = 0;
         for (; names[i][k] && k < sizeof low - 1; k++) low[k] = (char)((names[i][k] >= 'A' && names[i][k] <= 'Z') ? names[i][k] + 32 : names[i][k]);
         low[k] = 0;
@@ -172,13 +176,15 @@ static int tags_have_melee(uint8_t *beg, uint8_t *end)
     int byId = -1;
     if (ids_ready()) {
         byId = 0;
-        for (uint8_t *t = beg; t + TAG_SIZE <= end; t += TAG_SIZE) if (*(uint64_t *)t == g_idMelee) { byId = 1; break; }
+        for (uint8_t *t = beg; t + TAG_SIZE <= end; t += TAG_SIZE)
+            if (*(uint64_t *)t == g_idMelee || (g_meleeTag2Len && *(uint64_t *)t == g_idMelee2)) { byId = 1; break; }
         if (IDS_TRUSTED) return byId;
     }
     int byName = 0;
     for (uint8_t *t = beg; t + TAG_SIZE <= end && !byName; t += TAG_SIZE) {
         const MsString *s = (const MsString *)(t + TAG_NAME);
         if (s->size == g_meleeTagLen && !_strnicmp(ms_cstr(s), g_meleeTag, g_meleeTagLen)) byName = 1;
+        else if (g_meleeTag2Len && s->size == g_meleeTag2Len && !_strnicmp(ms_cstr(s), g_meleeTag2, g_meleeTag2Len)) byName = 1;
     }
     if (byId < 0) return byName;
 #ifndef FX_TEST
