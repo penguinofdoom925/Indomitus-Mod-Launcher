@@ -24,7 +24,7 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define SD_VERSION "0.1"
+#define SD_VERSION "0.1.1"
 #define SD_SECT    "SessionDump"
 
 /* ---------------------------------------------------------------- config */
@@ -119,18 +119,34 @@ static DWORD WINAPI worker(LPVOID p)
 {
     (void)p;
     load_dbghelp();
-    int held = 0;
+    int held = 0, reg = 0;
+    /* 0.1.1: a registered hotkey (WM_HOTKEY in this thread's queue). The 0.1 GetAsyncKeyState poll never saw Ctrl+Alt+F12 in the
+     * editor (Alex, Nov 8 2026: no snapshot, no log line; inferred: the engine's raw keyboard input leaves the async key state
+     * stale). The poll stays as a fallback when the combination is already taken by another program. */
+    if (cfg_hotkey) {
+        MSG m; PeekMessageA(&m, NULL, WM_USER, WM_USER, PM_NOREMOVE);           /* make sure this thread has a message queue */
+        reg = RegisterHotKey(NULL, 0x5D01, MOD_CONTROL | MOD_ALT | 0x4000 /* MOD_NOREPEAT */, VK_F12);
+        if (reg) logf_("hotkey Ctrl+Alt+F12 registered");
+        else logf_("hotkey Ctrl+Alt+F12 NOT registered (error %lu, taken by another program?) - falling back to key polling", GetLastError());
+    }
     for (;;) {
-        DWORD r = WaitForSingleObject(g_req, cfg_hotkey ? 100 : INFINITE);
+        DWORD r = cfg_hotkey ? MsgWaitForMultipleObjects(1, &g_req, FALSE, 100, QS_HOTKEY | QS_POSTMESSAGE)
+                             : WaitForSingleObject(g_req, INFINITE);
         if (r == WAIT_OBJECT_0) { write_dump(g_kind); SetEvent(g_done); continue; }
-        /* hotkey poll */
-        int down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000)
-                && (GetAsyncKeyState(VK_F12) & 0x8000);
-        if (down && !held && own_window_in_front()) {
-            write_dump(1);
-            MessageBeep(MB_OK);
+        if (!cfg_hotkey) continue;
+        MSG m; int hit = 0;
+        while (PeekMessageA(&m, NULL, 0, 0, PM_REMOVE))
+            if (m.message == WM_HOTKEY && m.wParam == 0x5D01) hit = 1;
+        if (hit) {
+            if (own_window_in_front()) { write_dump(1); MessageBeep(MB_OK); }
+            else logf_("hotkey pressed with another program in front, no snapshot");
         }
-        held = down;
+        if (!reg) {                                                             /* fallback: poll */
+            int down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_MENU) & 0x8000)
+                    && (GetAsyncKeyState(VK_F12) & 0x8000);
+            if (down && !held && own_window_in_front()) { write_dump(1); MessageBeep(MB_OK); }
+            held = down;
+        }
     }
 }
 
