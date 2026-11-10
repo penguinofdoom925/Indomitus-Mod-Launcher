@@ -18,6 +18,14 @@ toolchain `zig cc` wraps, same flags as build.bat, no warnings; imports only KER
 
 ## Changes
 
+**0.1.2** (Nov 8 2026, Alex: a squad jumped onto one point)
+- New `{spread M}` parameter (ini `default_spread`, 0 = off): each soldier lands at a point scattered uniformly within
+  M metres of the click. MP-safe: the seed is a hash of the unit's start position and the clicked point (lockstep
+  state every peer shares), and the point comes from rejection sampling with plain IEEE arithmetic (no RNG state, no
+  libm trig). The `max_radius` check still uses the clicked point; z stays the clicked ground height (on a slope the
+  unit may land slightly above/below ground until it moves - not checked yet). No obstacle/water check for the
+  scattered point either.
+
 **0.1.1** (review of 0.1.0 against the launcher logs of 29-30 Oct)
 - *Fix - the DLL was OFF in every launcher run.* `ReadFloat` was taken from `eHealthDamageCount` vtable slot 5, which
   GEM ScriptExt (loaded earlier) replaces: `reader: eHealthDamageCount not found`. Now found by its own code

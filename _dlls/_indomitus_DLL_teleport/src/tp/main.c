@@ -56,12 +56,25 @@ static void init(HMODULE self)
     g_defRadius = ini_float("default_max_radius", 30.0f);
     g_defPre    = ini_float("default_pre_use_delay", 0.5f);
     g_defPost   = ini_float("default_post_use_delay", 0.5f);
+    g_defSpread = ini_float("default_spread", 0.0f);
+    g_defFlight   = ini_float("default_flight_time", 0.0f);
+    g_defArcRatio = ini_float("default_arc_ratio", 0.2f);
+    g_defArcMax   = ini_float("default_arc_max", 8.0f);
+    g_defFace     = ini_float("default_face_offset", 0.0f);
+    g_defBandMid  = ini_float("default_band_mid", 15.0f);
+    g_defBandLong = ini_float("default_band_long", 28.0f);
+    g_lift       = ini_int("lift", 1);
+    g_aimEvents  = ini_int("aim_events", 1);
+    ini_str("cooldown_tag", "tp_cooldown", g_cdTag, sizeof g_cdTag);         /* 0.2.10; empty = no cooldown check */
+    { char h[32]; ini_str("ent_tags", "0x4E8", h, sizeof h); unsigned long v = strtoul(h, NULL, 0); if (v >= 0x100 && v < 0x4000 && !(v & 7)) g_entTagsOff = (uint32_t)v; }
+    logf_("cooldown: units tagged \"%s\" are refused with {on \"teleport_cooldown\"} (entity tags +0x%X)", g_cdTag[0] ? g_cdTag : "(off)", g_entTagsOff);
     g_fireEvents = ini_int("events", 1);
     g_wantLock   = ini_int("lock_orders", 1);
     g_wantInvuln = ini_int("invulnerable", 1);
     if (!(g_defRadius > 0)) g_defRadius = 30.0f;
     if (!(g_defPre >= 0)) g_defPre = 0.5f;
     if (!(g_defPost >= 0)) g_defPost = 0.5f;
+    if (!(g_defSpread >= 0) || g_defSpread > 1000.0f) g_defSpread = 0.0f;
 
     g_okCore = find_instr_registry() && find_read_float() && find_custom_action() && find_order_base() && find_set_pos() && find_world_scale();
     if (!g_okCore) { logf_("{teleport} instruction         OFF (engine code not recognised)"); return; }
@@ -71,7 +84,8 @@ static void init(HMODULE self)
     if (g_wantLock && !find_give_order()) g_wantLock = 0;
     if (g_wantInvuln && !find_damage()) g_wantInvuln = 0;
     install_hooks();
-    logf_("defaults: max_radius %g m, pre_use_delay %g s, post_use_delay %g s", g_defRadius, g_defPre, g_defPost);
+    logf_("defaults: max_radius %g m, pre_use_delay %g s, post_use_delay %g s, spread %g m, flight_time %g s, arc %g x dist (max %g m), face_offset %g, bands <%g / <%g m",
+          g_defRadius, g_defPre, g_defPost, g_defSpread, g_defFlight, g_defArcRatio, g_defArcMax, g_defFace, g_defBandMid, g_defBandLong);
     HANDLE t = CreateThread(NULL, 0, watch_thread, NULL, 0, NULL); if (t) CloseHandle(t);
 }
 
