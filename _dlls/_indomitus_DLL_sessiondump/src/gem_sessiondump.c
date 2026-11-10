@@ -24,7 +24,7 @@
 #include <string.h>
 #include <stdarg.h>
 
-#define SD_VERSION "0.1.1"
+#define SD_VERSION "0.1.2"
 #define SD_SECT    "SessionDump"
 
 /* ---------------------------------------------------------------- config */
@@ -245,6 +245,40 @@ static int install_hook(void)
 }
 
 /* ---------------------------------------------------------------- setup */
+/* The game's config root is Documents\\my games\\gates of hell on some PCs and
+   %LocalAppData%\\digitalmindsoft\\gates of hell on others; the unused one can hold a stale copy.
+   Take the root whose log\\game.log was written last (the server writes log_ds under the same root).
+   Runs inside DllMain: registry + env only (no shell32). */
+static ULONGLONG file_mtime(const char *path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return 0;
+    return ((ULONGLONG)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
+}
+
+static void game_root(char *out, size_t cap)
+{
+    char la[MAX_PATH] = "", docs[MAX_PATH] = "", raw[MAX_PATH], f[MAX_PATH + 32];
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", la, sizeof la)) la[0] = 0;
+    HKEY k;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders",
+                      0, KEY_QUERY_VALUE, &k) == ERROR_SUCCESS) {
+        DWORD sz = sizeof raw - 1, type = 0;
+        if (RegQueryValueExA(k, "Personal", NULL, &type, (BYTE *)raw, &sz) == ERROR_SUCCESS) {
+            raw[sz < sizeof raw ? sz : sizeof raw - 1] = 0;
+            if (!ExpandEnvironmentStringsA(raw, docs, sizeof docs)) docs[0] = 0;
+        }
+        RegCloseKey(k);
+    }
+    char a[MAX_PATH] = "", b[MAX_PATH] = "";
+    if (docs[0]) snprintf(a, sizeof a, "%s\\my games\\gates of hell", docs);
+    snprintf(b, sizeof b, "%s\\digitalmindsoft\\gates of hell", la);
+    ULONGLONG ta = 0, tb;
+    if (a[0]) { snprintf(f, sizeof f, "%s\\log\\game.log", a); ta = file_mtime(f); }
+    snprintf(f, sizeof f, "%s\\log\\game.log", b); tb = file_mtime(f);
+    snprintf(out, cap, "%s", (a[0] && ta >= tb && (ta || !tb)) ? a : b);
+}
+
 static void load_ini(const char *ini)
 {
     cfg_enabled = GetPrivateProfileIntA(SD_SECT, "Enabled", 1, ini);
@@ -257,10 +291,9 @@ static void load_ini(const char *ini)
     cfg_type = strtoul(buf, NULL, 0);
     GetPrivateProfileStringA(SD_SECT, "Dir", "", cfg_dir, sizeof cfg_dir, ini);
     if (!cfg_dir[0]) {
-        char la[MAX_PATH];
-        if (!GetEnvironmentVariableA("LOCALAPPDATA", la, sizeof la)) la[0] = 0;
-        snprintf(cfg_dir, sizeof cfg_dir, "%s\\digitalmindsoft\\gates of hell\\%s\\minidumps", la,
-                 strcmp(g_suffix, "_server") ? "log" : "log_ds");
+        char root[MAX_PATH];
+        game_root(root, sizeof root);
+        snprintf(cfg_dir, sizeof cfg_dir, "%s\\%s\\minidumps", root, strcmp(g_suffix, "_server") ? "log" : "log_ds");
     }
 }
 
