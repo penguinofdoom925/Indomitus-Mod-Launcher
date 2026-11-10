@@ -26,7 +26,7 @@ int main(int argc, char **argv)
     printf("%s timestamp %08X\n", argv[1], *(uint32_t *)(file + pe + 8));
     int ok = 1;
     ok &= find_weapon_layout();
-    ok &= find_human();
+    ok &= find_weapons();
     ok &= find_vehicle();
     ok &= find_priority();
     ok &= find_run_mode();

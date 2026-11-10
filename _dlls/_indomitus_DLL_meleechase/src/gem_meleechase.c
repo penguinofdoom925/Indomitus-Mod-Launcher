@@ -1,10 +1,10 @@
 /*
  * GEM MeleeChase  -  Call to Arms: Gates of Hell (GEM engine, 1.067)
  *
- * Better chasing for melee units:
- *   humans    a soldier whose weapon in hand carries the melee tag uses fight_distance_mult x the brain const
- *             "fight/distance" (vanilla 2 m) to start and keep a hand fight - in the AI battle state and in
- *             the player's attack order. The distance follows the weapon: switch to a rifle and it is vanilla.
+ * Better chasing for melee fauna / vehicles (vehicle-brain units only):
+ *   humans    not touched since 0.5.0. The fight-distance multiplier is removed; infantry melee (stance, draw,
+ *             charge, blow reach) is GEM MeleeStance's job, and two DLLs changing the hand-fight distance
+ *             worked against each other.
  *   vehicles  fauna / vehicles with a melee-tagged weapon keep re-planning their approach while the target
  *             moves, instead of driving to where the target was when the approach started.
  *   diag      crash log
@@ -16,7 +16,7 @@
  * Layout (unity build: this file is the only translation unit):
  *   mc/core.c        logging, ini, PE / .pdata / pattern / RTTI helpers    (from GEM Fauna 0.5.1)
  *   mc/patch.c       thread-safe patching: call redirection, vtable hooks  (from GEM Fauna 0.5.1)
- *   mc/melee.c       finders + hooks for both features
+ *   mc/melee.c       finders + hooks
  *   mc/crashlog.c    crash / process-exit logging                          (from GEM Fauna 0.5.1)
  *   mc/main.c        init sequence, DllMain
  *   mc/test_main.c   FX_TEST only: offline finder check against exe files (tests/run_offline_check.sh)
@@ -40,7 +40,7 @@ typedef int LONG;
 #include <string.h>
 #include <stdarg.h>
 
-#define FX_VERSION "0.4.0"
+#define FX_VERSION "0.5.0"
 #define FX_NAME    "GEM MeleeChase"
 #define FX_INI     L"\\gem_meleechase.ini"
 #define FX_LOG     L"\\gem_meleechase.log"

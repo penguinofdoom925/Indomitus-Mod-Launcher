@@ -36,8 +36,7 @@ static void init(HMODULE self)
     g_meleeTag[sizeof g_meleeTag - 1] = 0;
     g_meleeTagLen = strlen(g_meleeTag);
     if (!g_meleeTagLen) { logf_("melee_tag is empty - nothing to do"); return; }
-    int wantHuman = ini_int("human_fight_distance", 1), wantVehicle = ini_int("vehicle_chase", 1);
-    g_fightMult = ini_float("fight_distance_mult", 3.0f, 1.0f, 50.0f);
+    int wantVehicle = ini_int("vehicle_chase", 1);       /* 0.5.0: human_fight_distance / fight_distance_mult are gone (ignored if still in an ini) */
     g_repathMin = ini_float("repath_min_m", 1.0f, 0.2f, 100.0f) * WORLD_SCALE;
     g_repathMax = ini_float("repath_max_m", 10.0f, 0.2f, 500.0f) * WORLD_SCALE;
     if (g_repathMax < g_repathMin) g_repathMax = g_repathMin;
@@ -68,17 +67,12 @@ static void init(HMODULE self)
     if (!g_okWeapons) { logf_("melee weapon test               OFF (engine code not recognised) - nothing to do"); return; }
     logf_("melee weapon = weapon whose item carries the tag \"%s\"", g_meleeTag);
 
-    /* simulation (every exe): humans */
-    if (!wantHuman) logf_("human fight distance           off (ini)");
-    else {
-        g_okHuman = find_human() && install_human();
-        if (g_okHuman) logf_("human fight distance           ON (x%.2f while a melee weapon is in hand)", g_fightMult);
-        else logf_("human fight distance           OFF (engine code not recognised)");
-    }
+    /* 0.5.0: humans are not touched (infantry melee = GEM MeleeStance); nothing is hooked on human states */
+    logf_("humans                         not touched (0.5.0: fight distance multiplier removed, infantry melee = GEM MeleeStance)");
 
-    /* simulation (every exe): vehicles / fauna. Needs the weapon list found by the human finder. */
+    /* simulation (every exe): vehicles / fauna. Needs the weapon list found by the weapon finder. */
     if (!wantVehicle) logf_("vehicle melee chase            off (ini)");
-    else if (!o_wlistBeg && !find_human()) logf_("vehicle melee chase            OFF (weapon list not found)");
+    else if (!o_wlistBeg && !find_weapons()) logf_("vehicle melee chase            OFF (weapon list not found)");
     else {
         int found = find_vehicle();
         /* the priority props are set up before the tick hook goes live (vs_tick reads g_okPriority) */
@@ -111,7 +105,7 @@ static void init(HMODULE self)
         else if (g_okPriority) logf_("weapon priority props          ON (props \"%s\" / \"%s\")", g_propMelee, g_propRanged);
         else logf_("weapon priority props          OFF (engine code not recognised)");
     }
-    if (g_okHuman || g_okVehicle) logf_("simulation change: every player of a multiplayer match needs this DLL");
+    if (g_okVehicle) logf_("simulation change: every player of a multiplayer match needs this DLL");
 }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved)

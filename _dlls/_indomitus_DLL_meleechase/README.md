@@ -1,6 +1,6 @@
-# GEM MeleeChase 0.4.0
+# GEM MeleeChase 0.5.0
 
-Better chasing for melee units in Call to Arms - Gates of Hell 1.067: game, editor and dedicated server
+Better chasing for melee fauna and vehicles (vehicle-brain units) in Call to Arms - Gates of Hell 1.067: game, editor and dedicated server
 (`call_to_arms.exe`, `call_to_arms_ed.exe`, `call_to_arms_server.exe`). An Indomitus launcher payload DLL.
 
 **Status:** the offline check passes on game 6AB3DCC7, editor 6AB3DD83 and server 6AB3DD21: every finder is
@@ -8,19 +8,15 @@ found, and the Windows-target syntax check is clean. **Not built or run in game 
 
 ## What it does
 
-### Humans: a longer fight distance with a melee weapon in hand
-- **Vanilla behaviour:**
-  - A soldier only starts a hand fight when the enemy is closer than the brain const `fight/distance`
-    (`properties/human.ext`: `{const "fight/distance" 2}`). Then he runs in and strikes.
-  - He gives the fight up when the enemy gets more than 2 x that distance away.
-- **With MeleeChase:** while the weapon in his hands carries the melee tag, both distances use
-  `fight_distance_mult` x the const, 3 by default (so 6 m, and 12 m to give up). Switch to a rifle and he is
-  vanilla again.
-- **Where it applies:**
-  - the AI battle state (`Human::eOutdoorsBattle`);
-  - the player's attack order (`Order::eAttack`), which switches to the hand fight with the same rule.
-- **Note:** the hand fight itself is the vanilla one. The strike comes from `set/blow` (fist, rifle butt, knife,
-  bayonet). Your chainsword "gun" still fires when the enemy is inside its 3.5 m range.
+### Humans: not touched (0.5.0)
+- The fight-distance multiplier of 0.1-0.4 (`human_fight_distance`, `fight_distance_mult`: two
+  `Human::eOutdoorsBattle` vtable slots and the `Order::eAttack` const read) is removed. Both ini keys are ignored.
+- Why: infantry melee is GEM MeleeStance (melee stance, fight-range draw, charge, blow reach 45). Two DLLs
+  moving the same hand-fight distance worked against each other (stance marines stood staring at enemies inside
+  the tripled distance, Nov 7 2026), and the multiplier had been run at 1.0 since then.
+- Every remaining hook skips human entities (`ENT_FLAGS & 4`): the vehicle tick, the approach order, the
+  weapon-target hold. The "fight/distance" readers are still located, read-only, because one of them leads to
+  `GetCurrentWeapon` and the weapon list that the vehicle part needs (`find_weapons`, was `find_human`).
 
 ### Vehicles and fauna: the approach follows a moving target
 - **Vanilla behaviour:**
@@ -109,14 +105,13 @@ Put one prop in the unit's def (`{props "... ai_prioritize_melee"}`):
    (`%LocalAppData%\Indomitus Launcher\payload\<code>\`).
 
 **Expected startup lines:**
-- `human fight distance ON (x3.00 while a melee weapon is in hand)`
+- `humans not touched (0.5.0: fight distance multiplier removed, infantry melee = GEM MeleeStance)`
 - `vehicle melee chase ON (...)`
 - `melee close combat ON (goal radius 50% of melee reach, lead 0.60 s ...)`
 - `melee chase always ON ...` and `chase run mode ON (movement mode 2 while chasing)`
 - `weapon priority props ON (props "ai_prioritize_melee" / "ai_prioritize_ranged")`
 
 **What the log shows during play** (first few only):
-- `human ... holds a melee weapon: fight distance 2.0 m -> 6.0 m`
 - `melee unit ... approaches`
 - `target goal moved X m - new path (... moving away at N m/s)`
 - `target N m (moving away at N m/s) inside weapon range - chasing`
@@ -124,7 +119,7 @@ Put one prop in the unit's def (`{props "... ai_prioritize_melee"}`):
 - `melee-priority unit ...: target X m, approach range ... -> melee reach`
 
 ## Multiplayer
-Both features change AI decisions, so every player in a match needs the DLL. Decisions use only game state
+It changes AI decisions, so every player in a match needs the DLL. Decisions use only game state
 and game time (no wall clock, no randomness).
 
 ## Engine facts (1.067 game addresses; the finders derive them again on every start)
@@ -136,7 +131,7 @@ and game time (no wall clock, no randomness).
   std::string at +0x40).
 - This is the same read the AI's "can lie down" test does for `cannot_lie`.
 
-### Fight distance
+### Fight distance (located only since 0.5.0, nothing here is hooked)
 - Brain const getter: exe+0x9038A0 `(brain, Tag*, default)`. It returns metres x 20. A missing const logs
   "not declared" only when the default is 1e38.
 - `eOutdoorsBattle`:
@@ -144,7 +139,7 @@ and game time (no wall clock, no randomness).
   - Slot 3 (tick, exe+0x94A790) starts the fight: TryHandFight exe+0x94BBA0.
   - Slot 4 (exe+0x94A010) gives it up (distance > 2 x).
   - state +0x30 is the brain; brain +0x38 is the entity.
-- `eAttack` reads the const at exe+0x8EDA69 (call redirected).
+- `eAttack` reads the const at exe+0x8EDA69 (redirected until 0.4.0, untouched now).
 
 ### Brain update
 - When the brain has no AI order (brain+0xF0) and no user order (deque size brain+0x88), it runs the state's
