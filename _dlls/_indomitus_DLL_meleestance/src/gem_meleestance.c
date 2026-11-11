@@ -25,6 +25,8 @@
  *       built as MakeRef exe+0xB74420 does: vt, TagCtor(ref+0x20) exe+0x556220, RefInit(ref) exe+0xB8D30,
  *       SetEntity(ref, ent, &tag) exe+0x83DFA0 (registers the ref on the entity); freed by RefDtor exe+0x83E4F0
  *       + TagDtor(ref+0x20) exe+0x5564E0.
+ *       RefDtor unlinks the ref from the entity's back-ref list (entity+0x198 in the 1.067 exes, read from RefDtor's
+ *       "add rcx,imm32": a vector of 16-byte entries at list+8 / list+0x10, entry+8 = the ref) without any check.
  *     order = MakeAttack(&ref, 0) exe+0x8EA230 (new 0x108-byte Order::eAttack, copies the ref)
  *     eActor::AddOrder(actor, order, {int 1, uint [exe+0x1556DE8]}) exe+0x7EFA10 (frees the order on refusal)
  *   ammo {tag} Tags object at stuff+0xEC8 (read from the code), its tag vector at Tags+0x318.
@@ -46,7 +48,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-#define MS_VERSION "0.7.32"
+#define MS_VERSION "0.7.34"
 #define MAXT 24
 #define TLEN 48
 
@@ -698,13 +700,56 @@ static void ref_make(uint8_t *ref, void *ent)
     g_setent(ref, ent, tag);
     g_tagdtor(tag);
 }
+/* 0.7.33: a ref is only trusted while the entity it names still lists it. A player's Nov 10 crash (skirmish, 32 min in, one
+ * mission, game exe+0x7E6E90 under RefDtor exe+0x83E4F0, called by known_note's eviction): RefDtor walks the back-ref list of
+ * the entity at ref+0x18 to unlink the ref, and that entity's memory had been freed and reused (list begin inside the exe
+ * image, end 0), so the walk ran off the image. The engine had freed the entity without clearing our ref (ref+8 still 1), as
+ * it does for a whole scene (0.7.31); why for one entity mid-mission is not known. Such a ref also looked alive to every
+ * ref_ent() caller. Now: the entity's list must be readable, sane and hold an entry for this ref; if not, ref_ent() says
+ * "gone" and ref_free() zeroes the ref first, so RefDtor has nothing to unlink. g_reflist_off 0 (not found) = no check. */
+static uint32_t g_reflist_off;
+static uint32_t st_ref_stale; static int g_reflines;
+static int ref_listed(const uint8_t *ref)
+{
+    const uint8_t *ent = *(const uint8_t *const *)(ref + 0x18);
+    if (!ent || !g_reflist_off) return 1;
+    const uint8_t *l = ent + g_reflist_off;
+    if (!readable(l, 0x28)) return 0;
+    const uint8_t *b = *(const uint8_t *const *)(l + 8), *e = *(const uint8_t *const *)(l + 0x10);
+    if (!b || e <= b || ((size_t)(e - b) & 15) || (size_t)(e - b) > 0x100000 || !readable(b, (size_t)(e - b))) return 0;
+    for (; b < e; b += 16) if (*(const uint8_t *const *)(b + 8) == ref) return 1;
+    return 0;
+}
 static void ref_free(uint8_t *ref)
 {
+    if (!ref_listed(ref)) {
+        st_ref_stale++;
+        if (cfg_log && g_reflines < 20) {
+            g_reflines++;
+            logf_("ref: weak ref %p names entity %p (state %u) but is not in its ref list: entity freed without notice, dropped with no unlink",
+                  (void *)ref, *(void **)(ref + 0x18), *(uint32_t *)(ref + 8));
+        }
+        *(uint32_t *)(ref + 8) = 0; *(void **)(ref + 0x18) = NULL;
+    }
     *(void **)ref = g_refvt;
     g_refdtor(ref);
     g_tagdtor(ref + 0x20);
 }
-static void *ref_ent(const uint8_t *ref) { return *(const uint32_t *)(ref + 8) == 1 ? *(void *const *)(ref + 0x18) : NULL; }
+/* ref_ent() runs per weapon pick (up to 15000 a second in Alex's Nov 10 game with 256 units listed) and ref_listed() costs two
+ * VirtualQuery calls, so its answer is kept for the sim clock value it was made at, in the slot's spare bytes past the engine's
+ * 0x80-byte ref (ref_make clears them): +0xF0 clock + 1, +0xF4 answer, +0xF8 the entity it was made for. ref_free() always checks. */
+static void *ref_ent(const uint8_t *ref)
+{
+    if (*(const uint32_t *)(ref + 8) != 1) return NULL;
+    void *ent = *(void *const *)(ref + 0x18);
+    if (!ent || !g_reflist_off) return ent;
+    uint8_t *w = (uint8_t *)(uintptr_t)ref;
+    uint32_t stamp = g_clock ? *g_clock + 1 : 0;
+    if (stamp && *(uint32_t *)(w + 0xF0) == stamp && *(void **)(w + 0xF8) == ent) return *(uint32_t *)(w + 0xF4) ? ent : NULL;
+    int ok = ref_listed(ref);
+    *(uint32_t *)(w + 0xF0) = stamp; *(uint32_t *)(w + 0xF4) = (uint32_t)ok; *(void **)(w + 0xF8) = ent;
+    return ok ? ent : NULL;
+}
 
 static void last_reset(last_t *l, const void *unit)
 {
@@ -1627,6 +1672,23 @@ static void order_event(void *entity, void *order)
     known_note(e, *g_clock);
     g_poll_last = 0;                                            /* poll on the next tick, not after PollMs */
 }
+/* 0.7.34 hook timing ([MeleeStance] HookTiming). The heartbeat timed the tick only; in Alex's Nov 10 hosted games the server
+ * took 6700 MatchAmmo hook calls a second (24000 at the peak) and nothing said what one costs. Now: the dll's own time per
+ * outermost hook call (QueryPerformanceCounter around the body, minus the time inside the engine's MatchAmmo it calls on),
+ * the share of it spent in the order poll run from the scan, and the engine's share, all on the hb: line. Counter units
+ * are kept raw and converted when the line is written. Cost: 4-6 counter reads a call (about 0.15 us). */
+static int cfg_hooktime = 1;
+static volatile LONG64 st_hook_qpc, st_orig_qpc, st_hpoll_qpc;
+static volatile LONG st_hook_qpc_max, st_hook_timed;
+static inline LONGLONG qpc_now(void) { LARGE_INTEGER q; QueryPerformanceCounter(&q); return q.QuadPart; }
+static void *orig_timed(uint8_t *ctx)
+{
+    if (!cfg_hooktime) return g_orig(ctx);
+    LONGLONG a = qpc_now();
+    void *r = g_orig(ctx);
+    st_orig_qpc += qpc_now() - a;
+    return r;
+}
 /* helper thread: wakes the main thread for the tick, connects to GEM Teleport, writes the heartbeat. No engine calls here. */
 static DWORD WINAPI hb_thread(LPVOID p)
 {
@@ -1647,19 +1709,36 @@ static DWORD WINAPI hb_thread(LPVOID p)
         last = all; lastt = tk; lines++;
         int known = 0; for (int i = 0; i < NKNOWN; i++) if (g_known[i].used) known++;
         LONG mx = InterlockedExchange(&st_tick_us_max, 0);
-        logf_("hb: [%u ms] hook calls %ld (scan %ld, humans %ld, human vs enemy human %ld) | frame hook %s, ticks %ld (wrong thread %ld; sim %lu ui %lu) polls %ld, order events %ld, units on the poll list %d | tick cost: %lld us total, %ld us average, %ld us worst since the last line",
+        LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+        LONG hmx = InterlockedExchange(&st_hook_qpc_max, 0), hn = st_hook_timed;
+        long long hq = st_hook_qpc, oq = st_orig_qpc, pq = st_hpoll_qpc, f = qf.QuadPart ? qf.QuadPart : 1;
+        logf_("hb: [%u ms] hook calls %ld (scan %ld, humans %ld, human vs enemy human %ld) | frame hook %s, ticks %ld (wrong thread %ld; sim %lu ui %lu) polls %ld, order events %ld, units on the poll list %d | tick cost: %lld us total, %ld us average, %ld us worst since the last line"
+              " | hook cost: %lld us total over %ld timed calls (%lld us of it the order poll), %lld ns average, %lld us worst since the last line; engine MatchAmmo %lld us total",
               g_clock ? *g_clock : 0, all, (LONG)st_hk_scan, (LONG)st_hk_human, (LONG)st_hk_enemy,
               g_frame_state == 1 ? "ON" : g_frame_state == 2 ? "FAILED" : "not tried yet", tk, (LONG)st_tick_wrongthread,
               (DWORD)g_sim_tid, (DWORD)g_ui_tid, (LONG)st_hk_polls, (LONG)st_order_events, known,
-              (long long)st_tick_us, tk ? (LONG)(st_tick_us / tk) : 0, mx);
+              (long long)st_tick_us, tk ? (LONG)(st_tick_us / tk) : 0, mx,
+              hq * 1000000 / f, hn, pq * 1000000 / f, hn ? hq * 1000000000 / f / hn : 0, (long long)hmx * 1000000 / f, oq * 1000000 / f);
     }
     return 0;
 }
 static void hook_leave(int *x) { (void)x; g_in_hook--; }
 
+static void *ms_hook_body(uint8_t *ctx, uint8_t *ret);
 __attribute__((used, ms_abi, noinline)) void *ms_hook(uint8_t *ctx)
 {
     uint8_t *ret = (uint8_t *)__builtin_return_address(0);
+    if (!cfg_hooktime || g_in_hook) return ms_hook_body(ctx, ret);          /* a nested call is inside the outer one's time */
+    LONGLONG a = qpc_now(); LONG64 o0 = st_orig_qpc;
+    void *r = ms_hook_body(ctx, ret);
+    LONGLONG own = (qpc_now() - a) - (LONGLONG)(st_orig_qpc - o0);          /* the dll's part: not the engine's MatchAmmo */
+    if (own < 0) own = 0;
+    st_hook_qpc += own; st_hook_timed++;
+    if (own > st_hook_qpc_max) st_hook_qpc_max = own > 0x7FFFFFFF ? 0x7FFFFFFF : (LONG)own;
+    return r;
+}
+static __attribute__((noinline)) void *ms_hook_body(uint8_t *ctx, uint8_t *ret)
+{
     int from_scan = g_clock && g_scan_lo && ret >= g_scan_lo && ret < g_scan_hi;
     g_in_hook++; int hook_guard __attribute__((cleanup(hook_leave), unused)) = 0;   /* 0.7.22: no tick inside the hook */
     if (from_scan && !g_sim_tid) g_sim_tid = GetCurrentThreadId();
@@ -1667,7 +1746,7 @@ __attribute__((used, ms_abi, noinline)) void *ms_hook(uint8_t *ctx)
     {   /* 0.7.28: a target the dll must ignore (hidden / melee_disabled / call-ins) -> the engine picks on its own */
         const uint8_t *iti = *(const uint8_t *const *)(ctx + 0x10);
         const uint8_t *itg = iti ? *(const uint8_t *const *)(iti + 0x18) : NULL;
-        if (itg && (itg[0x30] & 0x02) && ignored_target(itg)) { st_hk_all++; st_tgt_ignored++; return g_orig(ctx); }
+        if (itg && (itg[0x30] & 0x02) && ignored_target(itg)) { st_hk_all++; st_tgt_ignored++; return orig_timed(ctx); }
     }
     if (from_scan && cfg_charge) charge_flush(*(uint8_t **)(ctx + 8));
     if (from_scan && (cfg_ad_on || cfg_veh_on)) { autodraw_flush(*(uint8_t **)(ctx + 8)); scan_note(ctx); }
@@ -1687,7 +1766,8 @@ __attribute__((used, ms_abi, noinline)) void *ms_hook(uint8_t *ctx)
         uint8_t *st = sti ? *(uint8_t *const *)(sti + 0x18) : NULL;              /* order never scans, but the enemy's scans see it */
         if (st && st != su && (st[0x30] & 0x04) && !linked_raw(st) && cfg_poll_on) known_note(st, *g_clock);
         if (su && st && st != su && (su[0x30] & 0x04) && (st[0x30] & 0x04)) hostile_set(su[0xDA8], st[0xDA8]);   /* 0.7.24: an enemy scan's target is hostile */
-        order_poll(su, *g_clock);
+        if (cfg_hooktime) { LONGLONG pa = qpc_now(); order_poll(su, *g_clock); st_hpoll_qpc += qpc_now() - pa; }
+        else order_poll(su, *g_clock);
     }
     if (!from_scan && cfg_log && g_rawlines < 40) {            /* 0.7.18: what reaches the hook from outside the scan, unfiltered */
         g_rawlines++;
@@ -1723,7 +1803,7 @@ __attribute__((used, ms_abi, noinline)) void *ms_hook(uint8_t *ctx)
     if (d == MELEE) {
         if (cfg_lift_ready) ctx[0x18] = 1;
         float saved[3]; int shifted = adj_shift(ctx, saved);
-        r = g_orig(ctx);
+        r = orig_timed(ctx);
         if (shifted) { float *pt = (float *)(*(uint8_t **)(ctx + 0x10) + 0x28); pt[0] = saved[0]; pt[1] = saved[1]; pt[2] = saved[2]; }
         ctx[0x18] = ready;
         if (r) {
@@ -1735,7 +1815,7 @@ __attribute__((used, ms_abi, noinline)) void *ms_hook(uint8_t *ctx)
                 logf_("stance: unit %p takes \"%s\" (refused %u, melee picks %u)", *(void **)(ctx + 8), nm, st_reject, st_allow);
             }
         }
-    } else r = g_orig(ctx);
+    } else r = orig_timed(ctx);
     if ((from_scan || ord) && cfg_charge && r) charge_note(ctx, ready != 0, d == MELEE);
     return r;
 }
@@ -1921,7 +2001,7 @@ static void log_epoch(uint32_t now)
 {
     if (g_epoch_last && now + 5000 < g_epoch_last) {
         mission_flush();
-        g_lines = g_clines = g_hlines = g_vlines = g_vreflines = g_adjlines = g_adlines = g_rclines = g_dlines = g_mlines = g_mdiag = g_seenlines = g_addiag = g_plines = g_skiplines = g_olines = g_rawlines = g_polllines = g_ovtlines = g_rblines = 0;
+        g_lines = g_clines = g_hlines = g_vlines = g_vreflines = g_adjlines = g_adlines = g_rclines = g_dlines = g_mlines = g_mdiag = g_seenlines = g_addiag = g_plines = g_skiplines = g_olines = g_rawlines = g_polllines = g_ovtlines = g_rblines = g_reflines = 0;
         if (cfg_log) logf_("--- clock %u -> %u: new mission, log line caps reset, unit tables cleared", g_epoch_last, now);
     }
     g_epoch_last = now;
@@ -2125,6 +2205,7 @@ typedef struct {
     uint8_t *fight, *mvchange, *uimove;      /* 0.6.9: eFight factory, eMovementChange factory, the UI click-move factory */
     uint8_t *range, *scan_lo, *scan_hi, *mkatk, *addorder, *mkref, *setent, *refinit, *tagctor, *refvt,
             *refdtor, *tagdtor, *ordstamp, *clock;
+    uint32_t reflist;                        /* 0.7.33: entity offset of its back-ref list, from RefDtor (0 = not found) */
     const char *charge_err;
     /* blow reach table (near/medium/far) */
     float *blowtab; uint8_t *blowfn;
@@ -2228,6 +2309,11 @@ static const char *find_charge(img_t *im, sites_t *s)
     q += 17;
     s->refdtor = next_call(im, q, 0x30, &at);
     if (!s->refdtor) return "ref destructor not found";
+    for (int i = 0; i < 0x60 && !s->reflist; i++) {      /* add rcx,imm32; mov rdx,rbx; call unlink */
+        const uint8_t *d = s->refdtor + i;
+        if (d[0] == 0x48 && d[1] == 0x81 && d[2] == 0xC1 && d[7] == 0x48 && d[8] == 0x8B && d[9] == 0xD3 && d[10] == 0xE8
+            && *(const uint32_t *)(d + 3) < 0x1000) s->reflist = *(const uint32_t *)(d + 3);
+    }
     s->tagdtor = next_call(im, at + 5, 0x20, NULL);
     if (!s->tagdtor) return "tag destructor not found";
     /* order stamp: mov e?x,[rip+g] within 0x40 bytes before MakeAttack */
@@ -2612,6 +2698,7 @@ static void load_ini(const char *ini)
         n_tgttags = split_list(sk, cfg_tgttags, 8); }
     cfg_order_on = GetPrivateProfileIntA("AutoDraw", "OrderPicks", 1, ini);                  /* 0.7.17 */
     cfg_manual_diag = GetPrivateProfileIntA("MeleeStance", "DiagManual", 1, ini);          /* 0.7.14 */
+    cfg_hooktime = GetPrivateProfileIntA("MeleeStance", "HookTiming", 1, ini);             /* 0.7.34 */
     GetPrivateProfileStringA("MeleeStance", "Tag", "melee_stance", cfg_tag, sizeof cfg_tag, ini);
     GetPrivateProfileStringA("MeleeStance", "MeleeAmmoTags",
         "melee_light,melee_heavy,medium_inf_melee_target,medium_veh_melee_target,heavy_veh_melee_target", buf, sizeof buf, ini);
@@ -2759,6 +2846,9 @@ static void install(void)
         if (s.mvchange) logf_("  charge: eMovementChange exe+0x%llX, RunMode=%d", (unsigned long long)(s.mvchange - base), cfg_runmode);
         g_refinit = (vfn1_t)s.refinit; g_tagctor = (vfn1_t)s.tagctor; g_refvt = s.refvt;
         g_refdtor = (vfn1_t)s.refdtor; g_tagdtor = (vfn1_t)s.tagdtor;
+        g_reflist_off = s.reflist;
+        if (s.reflist) logf_("  refs: entity ref list at +0x%X, stale refs are dropped without unlink", s.reflist);
+        else logf_("  refs: entity ref list offset not found in RefDtor, stale-ref check OFF");
         g_ordstamp = (volatile uint32_t *)s.ordstamp; g_clock = (volatile uint32_t *)s.clock;
     }
 
@@ -3007,6 +3097,8 @@ int main(int argc, char **argv)
                "          RefDtor exe+0x%llX TagDtor exe+0x%llX stamp exe+0x%llX clock exe+0x%llX\n",
                R(s.scan_lo), R(s.scan_hi), R(s.range), R(s.mkatk), R(s.addorder), R(s.mkref), R(s.setent), R(s.refinit),
                R(s.tagctor), R(s.refvt), R(s.refdtor), R(s.tagdtor), R(s.ordstamp), R(s.clock));
+        if (s.reflist) printf("  refs: entity ref list at +0x%X\n", s.reflist);
+        else { printf("  FAIL refs: entity ref list offset not found in RefDtor\n"); bad = 1; }
     }
     cfg_log = 0; init_tag(); g_orig = (match_t)fake_orig;
     static fake_t man, sm_inst, crew, tank, sword, bolter, nade, hvy, enemy;
@@ -3422,6 +3514,34 @@ int main(int argc, char **argv)
         printf("fight range: no-probe %d probe %d gun-refused %d melee-found %d no-reprobe %d probe2 %d refused2 %d none %d gun-kept %d no-melee-wait %d reprobe %d | fight queued %d ordered %d cooldown %d running %d other %d off %d -> %s\n",
                p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, f1, f2, f3, f4, f5, f6, ok ? "OK" : "FAIL");
         if (!ok) fails++;
+    }
+    {   /* 0.7.33 stale refs: listed -> alive and unlinked as before; not listed / broken list -> gone, zeroed before RefDtor */
+        static fake_t re; memset(&re, 0, sizeof re);
+        static uint8_t rlist[0x40]; __attribute__((aligned(16))) static uint8_t rr[REFSZ];
+        memset(rlist, 0, sizeof rlist); memset(rr, 0, sizeof rr);
+        g_reflist_off = 0x198;
+        *(uint32_t *)(rr + 8) = 1; *(void **)(rr + 0x18) = re.obj;
+        *(void **)(rlist + 0x18) = rr;                                       /* second entry names the ref */
+        *(void **)(re.obj + 0x198 + 8) = rlist; *(void **)(re.obj + 0x198 + 0x10) = rlist + 0x20;
+        uint32_t s0 = st_ref_stale;
+        int r1 = ref_ent(rr) == re.obj;
+        ref_free(rr); int r2 = st_ref_stale == s0 && *(void **)(rr + 0x18) == re.obj;        /* listed: left to RefDtor */
+        int r1b = ref_ent(rr) == re.obj;
+        *(void **)(rlist + 0x18) = NULL;
+        int r3a = ref_ent(rr) == re.obj;                                     /* same clock value: the kept answer */
+        f_clock++;
+        int r3 = r1b && r3a && ref_ent(rr) == NULL;                          /* next clock value: entry gone */
+        *(void **)(re.obj + 0x198 + 8) = (void *)GetModuleHandleA(NULL); *(void **)(re.obj + 0x198 + 0x10) = NULL;   /* the crash: begin in the image, end 0 */
+        f_clock++;
+        int r4 = ref_ent(rr) == NULL;
+        ref_free(rr); int r5 = st_ref_stale == s0 + 1 && *(void **)(rr + 0x18) == NULL && *(uint32_t *)(rr + 8) == 0;
+        *(void **)(rr + 0x18) = (void *)(uintptr_t)0x10; *(uint32_t *)(rr + 8) = 1;          /* entity memory unmapped */
+        f_clock++;
+        int r6 = ref_ent(rr) == NULL;
+        g_reflist_off = 0; int r7 = ref_ent(rr) == (void *)(uintptr_t)0x10;                  /* offset unknown: no check, as 0.7.32 */
+        printf("stale refs: listed %d kept %d unlisted %d broken-list %d zeroed %d unmapped %d check-off %d -> %s\n",
+               r1, r2, r3, r4, r5, r6, r7, r1 && r2 && r3 && r4 && r5 && r6 && r7 ? "OK" : "FAIL");
+        if (!(r1 && r2 && r3 && r4 && r5 && r6 && r7)) fails++;
     }
     printf("filter: %zu cases + 3 hook cases + charge, %d failed\n", sizeof c / sizeof c[0], fails);
     if (fails) bad = 1;
