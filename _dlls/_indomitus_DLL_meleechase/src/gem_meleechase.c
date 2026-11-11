@@ -40,7 +40,7 @@ typedef int LONG;
 #include <string.h>
 #include <stdarg.h>
 
-#define FX_VERSION "0.5.1"
+#define FX_VERSION "0.5.2"
 #define FX_NAME    "GEM MeleeChase"
 #define FX_INI     L"\\gem_meleechase.ini"
 #define FX_LOG     L"\\gem_meleechase.log"
