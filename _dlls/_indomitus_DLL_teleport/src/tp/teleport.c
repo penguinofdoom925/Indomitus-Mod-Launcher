@@ -478,6 +478,14 @@ static void tp_aim_scan(void)
             g_aim[k].active = 0; g_aim[k].entity = NULL;
             if (g_aimLogged < 12) { logf_("aim: teleport_aim_end -> unit %p", e); g_aimLogged++; }
             fire_named(e, "teleport_aim_end");
+        } else if (!fresh && !g_aim[k].active) {
+            /* 0.2.13: stamped by the window thread, but no scan ran while the stamp was fresh (simulation paused, a
+               loading stall, no quant tick registered yet). No begin event went out, so there is no end to send; the
+               slot is just given back. Before, nothing freed it: the unit kept its slot until it was aimed with again,
+               and after TP_MAXAIM such slots tp_aim() found no spare one and the aim events (range rings) stopped for
+               every other unit until the game was restarted. A stamp that lands while this runs is not lost for
+               long: the window thread stamps every frame and takes a new slot on the next one. */
+            g_aim[k].entity = NULL;
         }
     }
 }
