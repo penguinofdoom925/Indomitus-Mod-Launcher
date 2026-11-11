@@ -18,7 +18,7 @@
  * swaps the locked point into the aimer's target for the duration of the engine's guidance and does the drift.
  */
 #define GEM_NAME    "GEM Guidance"
-#define GEM_VERSION "1.1"
+#define GEM_VERSION "1.1.2"
 #define GEM_SECT    L"guidance"
 #include "../common/gem_common.h"
 
@@ -146,6 +146,9 @@ static Lock *lock_find(void *bullet)
     for (int i = 0; i < MAX_LOCKS; i++) if (g_locks[i].bullet == bullet) return &g_locks[i];
     return NULL;
 }
+/* 1.1.2: how many lock slots are in use, so Bullet::Quant can leave at once when there is none */
+static int g_lockCount;
+static void lock_drop(Lock *l) { if (l->bullet) { l->bullet = NULL; g_lockCount--; } }
 
 static void lock_target(const uint8_t *weapon, const double *aim)
 {
@@ -210,17 +213,23 @@ static char hook_spawn_bullet(void *shooter, int syncIdx, float *zero, float *di
     return r;
 }
 
-/* Bullet::Launch: the bullet SpawnBullet just created comes through here -> bind the pending lock to it */
+/* Bullet::Launch: the bullet SpawnBullet just created comes through here -> bind the pending lock to it.
+   1.1.2: every bullet, however it was created, also comes through here: the drift question is asked now (dreg_launch) */
+static void dreg_launch(void *bullet);
 static BulletLaunchFn g_bulletLaunchOrig;
 static void hook_bullet_launch(void *bullet, float *pos, float *vel, float gravity)
 {
     g_bulletLaunchOrig(bullet, pos, vel, gravity);
-    if (!g_on || !g_pendingLock) return;
+    if (!g_on) return;
+    dreg_launch(bullet);
+    if (!g_pendingLock) return;
     Lock *l = lock_find(bullet);
-    if (!l) { for (int i = 0; i < MAX_LOCKS; i++) if (!g_locks[i].bullet) { l = &g_locks[i]; break; } }
+    int fresh = 0;
+    if (!l) { for (int i = 0; i < MAX_LOCKS; i++) if (!g_locks[i].bullet) { l = &g_locks[i]; fresh = 1; break; } }
     if (!l) return;
     *l = g_pending;
     l->bullet = bullet;
+    g_lockCount += fresh;
     memcpy(l->origin, (uint8_t *)bullet + BUL_ORIGIN, 12);
 }
 
@@ -242,12 +251,32 @@ static int lock_target_pos(Lock *l, float *out)
    distance (N = degrees off at 100 units, twice that at 200...). Each round draws its own strength (0..N)
    and direction from the launch geometry, so lockstep machines agree. Implemented by sliding the launch
    origin sideways every tick: the engine's closed-form flight (origin + v*t - gravity) keeps its gravity. */
-typedef struct { const void *stuff; int n; } DriftTagCache;
+/* 1.1.2: a cached answer is trusted for DRIFT_CACHE_MS only. The cache is keyed by the weapon's eStuff address, and
+   every eStuff is recreated on a map load: an old address can come back as a different weapon (gem_overcharge.c keeps
+   names beside its pointers for the same reason). Before, an entry lived until 32 newer weapon types pushed it out, so
+   after a map change a drift_<N> launcher could fly straight, or a plain gun drift, on this machine only (heap
+   addresses differ per machine: in a network game that is a desync). This module has no "new mission" signal and only
+   runs while bullets fly, so entries simply expire: a map load takes far longer than the window, and reading one
+   weapon's tags again twice a second costs about a microsecond. The answer itself only depends on the weapon's tags,
+   so when it is read does not change the simulation. */
+#define DRIFT_CACHE_MS 500
+#ifdef GEM_TEST
+static uint32_t g_driftTestTick;        /* the test's clock */
+#define drift_now() g_driftTestTick
+#else
+#define drift_now() ((uint32_t)GetTickCount())
+#endif
+typedef struct { const void *stuff; int n; uint32_t at; } DriftTagCache;
 static DriftTagCache g_driftCache[32];
 
 static int stuff_drift(const uint8_t *stuff)
 {
-    for (int i = 0; i < 32; i++) if (g_driftCache[i].stuff == stuff) return g_driftCache[i].n;
+    uint32_t now = drift_now();
+    int at = -1;
+    for (int i = 0; i < 32; i++) if (g_driftCache[i].stuff == stuff) {
+        if ((uint32_t)(now - g_driftCache[i].at) < DRIFT_CACHE_MS) return g_driftCache[i].n;
+        at = i; break;                                  /* expired: read the tags again, into the same slot */
+    }
     int n = 0;
     const uint8_t *b = NULL, *e = NULL;
     if (rd_mem(stuff + g_stuffTagsBeg, &b, 8) && rd_mem(stuff + g_stuffTagsEnd, &e, 8) && b && e > b && (size_t)(e - b) <= TAG_SIZE * 256)
@@ -256,7 +285,8 @@ static int stuff_drift(const uint8_t *stuff)
             if (len > 6 && len < 64 && !_strnicmp(s, "drift_", 6)) { int v = atoi(s + 6); if (v >= 1 && v <= g_driftMax) n = v; }
         }
     static int slot;
-    g_driftCache[slot] = (DriftTagCache){ stuff, n }; slot = (slot + 1) % 32;
+    if (at < 0) { at = slot; slot = (slot + 1) % 32; }
+    g_driftCache[at] = (DriftTagCache){ stuff, n, now };
     return n;
 }
 
@@ -304,25 +334,68 @@ static void drift_tick(uint8_t *b, int n)
     d->dPrev = dn; d->lastT = (int16_t)(t + ms);
 }
 
+/* ---- 1.1.2: which bullets in flight belong to a drift_<N> weapon ---------------------- */
+/* Before, Bullet::Quant asked this of every bullet on every tick: a system call to read the bullet's weapon, then the
+   cache above (Alex's Nov 11 2026 audit: about 0.4 us per bullet per tick, for the two launchers that carry
+   drift_<N>). Now it is asked once, when the bullet is launched, and the answer is kept for the few rounds that do
+   drift; with no such round and no locked round in flight Bullet::Quant goes straight to the engine.
+   It is asked in the Bullet::Launch hook, not in SpawnBullet, because the exe builds bullets in three places:
+   SpawnBullet, the second branch of eWeaponBulletShootingCommand (the network path of SyncedProjectiles weapons, which
+   the HKM launchers are; it copies a bullet instead of calling SpawnBullet) and the HEAT jet of
+   Damage::eEffectDescCumulative. All three write the weapon into bullet+0x128 and then call Bullet::Launch (1.067
+   game exe: written at exe+0x81AB83 / 0xABEE8 / 0xA741E5, called at exe+0x81ADD2 / 0xABF51 / 0xA742B0). A re-launch of
+   the same bullet (guided rounds, every tick) asks again and gets the same answer.
+   A registration ends with the bullet's last tick. One whose bullet went without a last tick (its scene was freed
+   mid-flight) is told by its age in Bullet::Quant calls, not in time, so a paused game cannot age a live round: every
+   live bullet is ticked once per quant, so one not seen for DREG_STALE calls is gone. Until it is swept (at the next
+   launch) it costs only the fast exit, and a new bullet at its address is asked afresh at its own launch. */
+typedef struct { void *bullet; int n; uint32_t seq; } DriftReg;
+#define DREG_STALE 0x10000
+static DriftReg g_dreg[MAX_DRIFT];
+static int g_dregCount;
+static uint32_t g_quantSeq;                 /* Bullet::Quant calls seen while a registration existed */
+
+static void drift_forget(const void *bullet) { for (int i = 0; i < MAX_DRIFT; i++) if (g_drift[i].bullet == bullet) g_drift[i].bullet = NULL; }
+static DriftReg *dreg_find(const void *bullet) { for (int i = 0; i < MAX_DRIFT; i++) if (g_dreg[i].bullet == bullet) return &g_dreg[i]; return NULL; }
+static void dreg_release(DriftReg *r) { drift_forget(r->bullet); r->bullet = NULL; g_dregCount--; }
+
+static void dreg_launch(void *bullet)
+{
+    const uint8_t *wstuff = *(const uint8_t *const *)((const uint8_t *)bullet + BUL_WEAPON);
+    int n = wstuff ? stuff_drift(wstuff) : 0;
+    if (n <= 0 && !g_dregCount) return;                 /* the usual case: not a drift weapon, and none in flight */
+    DriftReg *mine = NULL, *spare = NULL;
+    for (int i = 0; i < MAX_DRIFT; i++) {
+        DriftReg *r = &g_dreg[i];
+        if (r->bullet == bullet) { mine = r; continue; }
+        if (r->bullet && (uint32_t)(g_quantSeq - r->seq) > DREG_STALE) dreg_release(r);
+        if (!r->bullet && !spare) spare = r;
+    }
+    if (n > 0) {
+        if (!mine) { if (!spare) return; mine = spare; mine->bullet = bullet; g_dregCount++; }
+        mine->n = n; mine->seq = g_quantSeq;
+    } else if (mine) dreg_release(mine);                /* this address held a drift round that went without a last tick */
+}
+
 /* Bullet::Quant: for a locked bullet the engine's atgm branch reads aimer+target; swap our point in for the
    duration of the call. Without an aimer (owner dead, item dropped) steer the velocity ourselves. */
 static BulletQuantFn g_bulletQuantOrig;
 static char hook_bullet_quant(void *bullet)
 {
     if (!g_on) return g_bulletQuantOrig(bullet);
-    Lock *l = lock_find(bullet);
+    if (!g_lockCount && !g_dregCount) return g_bulletQuantOrig(bullet);   /* 1.1.2: no locked and no drift_<N> round in flight */
+    DriftReg *r = NULL;
+    if (g_dregCount) { g_quantSeq++; r = dreg_find(bullet); if (r) r->seq = g_quantSeq; }
+    Lock *l = g_lockCount ? lock_find(bullet) : NULL;
     if (!l) {
-        const uint8_t *wstuff = NULL;
-        if (rd_mem((uint8_t *)bullet + BUL_WEAPON, &wstuff, 8) && wstuff) {
-            int n = stuff_drift(wstuff);
-            if (n > 0) drift_tick((uint8_t *)bullet, n);
-        }
+        if (r) drift_tick((uint8_t *)bullet, r->n);
         char alive = g_bulletQuantOrig(bullet);
-        if (!alive) for (int i = 0; i < MAX_DRIFT; i++) if (g_drift[i].bullet == bullet) g_drift[i].bullet = NULL;
+        /* looked up again: the engine can re-launch the bullet inside its own quant, which passes dreg_launch */
+        if (!alive && g_dregCount && (r = dreg_find(bullet)) != NULL) dreg_release(r);
         return alive;
     }
     uint8_t *b = (uint8_t *)bullet;
-    if (memcmp(l->origin, b + BUL_ORIGIN, 12) && !l->fallback) { l->bullet = NULL; return g_bulletQuantOrig(bullet); }   /* slot reused */
+    if (memcmp(l->origin, b + BUL_ORIGIN, 12) && !l->fallback) { lock_drop(l); return g_bulletQuantOrig(bullet); }   /* slot reused */
     float tp[3]; lock_target_pos(l, tp);
     /* drift on a guided round: the engine flies it from its current position (no closed form to bend),
        so the lock point itself walks sideways with the distance flown -> the miss grows with range */
@@ -389,7 +462,9 @@ static char hook_bullet_quant(void *bullet)
             logf_("lock end: %d ticks, %.1f units from the target, flew %.0f units, drift offset %.1f%s", l->ticks, sqrt(dx*dx + dy*dy + dz*dz),
                   flown, l->driftN > 0 ? l->dtan * flown : 0.0, l->fallback ? " (dll steering)" : "");
         }
-        l->bullet = NULL;
+        lock_drop(l);
+        /* a round that is only flagged finished keeps its registration until its last tick, as it kept drifting before */
+        if (!alive && g_dregCount && (r = dreg_find(bullet)) != NULL) dreg_release(r);
     }
     return alive;
 }
