@@ -145,6 +145,7 @@ struct Config {
     std::wstring modsMarker = L"INDOMITUS MOD LAUNCHER";     // ini: mods_marker= (words in a mod.info {desc ""})
     bool         modsExclusive = false;    // true = enable ONLY those
     std::wstring modsProfile;              // profile folder id; empty = most recently used
+    std::wstring hotkeys;                  // ini: hotkeys= ("name=VALUE;name=VALUE"): default keys added to the profile keys.set when missing
     bool         showModFolderButton = true; // ini: show_mod_folder_button=
     bool         showDisableModsButton = true; // ini: show_disable_mods_button=
     std::wstring version;                  // shown in the window (ini: version=)
@@ -830,6 +831,69 @@ static bool EnsureModsEnabled(const Config& cfg, std::wstring& err)
     return true;
 }
 
+// ---- ability hotkeys
+// The mod's ability buttons name a key slot ({Key "actions/melee_toggle"} in resource\interface\action\*.set), and the game
+// only reads slots from the player's own <profile>\keys.set: defaults shipped inside a mod are ignored, so until now every
+// player had to add the lines by hand. Before each launch the slots listed in hotkeys= that are MISSING from keys.set are
+// added with their default key. A slot that is already there is never touched, whatever it is bound to (the player's own
+// choice, or cleared on purpose with {value ""}). A one-time keys.set.launcher-backup is kept. Never blocks the launch.
+//   {keys
+//       {"actions/jetpack"
+//           {value "DOUBLE + KEY_J"}
+//       }
+//   }
+static void EnsureHotkeys(const Config& cfg)
+{
+    if (cfg.hotkeys.empty()) return;
+    std::wstring opt = FindOptionsSet(cfg);
+    if (opt.empty()) return;                                   // no profile yet (first start): next launch
+    size_t slash = opt.find_last_of(L'\\');
+    if (slash == std::wstring::npos) return;
+    std::wstring keys = opt.substr(0, slash) + L"\\keys.set";
+    if (!PathFileExistsW(keys.c_str())) { Log(L"hotkeys: no %ls yet - nothing added", keys.c_str()); return; }
+    std::string text = ReadFileA(keys);
+    size_t open = text.find("{keys"), last = text.rfind('}');
+    if (text.empty() || open == std::string::npos || last == std::string::npos || last < open) {
+        Log(L"hotkeys: unexpected layout in %ls - left alone", keys.c_str());
+        return;
+    }
+    const char* nl = text.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+
+    std::string add; std::wstring added;
+    const std::string list = Utf8(cfg.hotkeys);
+    for (size_t a = 0; a < list.size();) {
+        size_t b = list.find(';', a);
+        if (b == std::string::npos) b = list.size();
+        std::string item = list.substr(a, b - a);
+        a = b + 1;
+        size_t eq = item.find('=');
+        if (eq == std::string::npos) continue;
+        auto trim = [](std::string v) {
+            size_t i = v.find_first_not_of(" \t"), j = v.find_last_not_of(" \t");
+            return i == std::string::npos ? std::string() : v.substr(i, j - i + 1);
+        };
+        std::string name = trim(item.substr(0, eq)), value = trim(item.substr(eq + 1));
+        if (name.empty() || value.empty() || name.find('"') != std::string::npos || value.find('"') != std::string::npos) continue;
+        // present already? the slot name in quotes, any case
+        std::string hay = AsciiLower(text), needle = "\"" + AsciiLower(name) + "\"";
+        if (hay.find(needle) != std::string::npos) continue;
+        bool quote = value.find(' ') != std::string::npos || value.find('+') != std::string::npos;
+        add += std::string("\t{\"") + name + "\"" + nl + "\t\t{value " + (quote ? "\"" + value + "\"" : value) + "}" + nl + "\t}" + nl;
+        if (!added.empty()) added += L", ";
+        added += Widen(name) + L" = " + Widen(value);
+    }
+    if (add.empty()) { Log(L"hotkeys: all ability keys already in %ls", keys.c_str()); return; }
+
+    // the new lines go right before the closing brace of {keys}, on a line of their own
+    std::string head = text.substr(0, last);
+    if (!head.empty() && head.back() != '\n') head += nl;
+    std::string out = head + add + text.substr(last);
+    std::wstring err;
+    if (!EnsureProfileBackup(keys, text, err)) { Log(L"hotkeys: %ls", err.c_str()); return; }
+    if (!WriteFileAtomic(keys, out)) { Log(L"hotkeys: could not write %ls - nothing added", keys.c_str()); return; }
+    Log(L"hotkeys added to %ls: %ls", keys.c_str(), added.c_str());
+}
+
 // Removes the configured mods from the profile list so a plain Steam start runs vanilla.
 static bool DisableRequiredMods(const Config& cfg, std::wstring& err, int& removed)
 {
@@ -1210,6 +1274,7 @@ static int StartAndInject(const std::wstring& exe, const std::vector<std::wstrin
     {
         std::wstring err;
         if (!EnsureModsEnabled(g_cfg, err)) return Fail(8, L"Could not enable the required mods:\n%ls", err.c_str());
+        EnsureHotkeys(g_cfg);
     }
 
     std::wstring exeDir = DirOf(exe);
@@ -2960,6 +3025,7 @@ static int RealMain(int argc, wchar_t** argv)
         cfg.modsMarker    = ReadIni(L"mods_marker", L"INDOMITUS MOD LAUNCHER");
         cfg.modsExclusive = ReadIni(L"mods_exclusive", L"0") == L"1";
         cfg.modsProfile   = ReadIni(L"mods_profile");
+        cfg.hotkeys       = ReadIni(L"hotkeys", L"actions/melee_toggle=DOUBLE + KEY_M;actions/overcharge=DOUBLE + KEY_O;actions/jetpack=DOUBLE + KEY_J;actions/sacrifice=DOUBLE + KEY_K;actions/activate_drop=SHIFT + KEY_SPACE");
         cfg.showModFolderButton = ReadIni(L"show_mod_folder_button", L"1") != L"0";
         cfg.showDisableModsButton = ReadIni(L"show_disable_mods_button", L"1") != L"0";
         cfg.version    = ReadIni(L"version");
