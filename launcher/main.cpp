@@ -3025,7 +3025,7 @@ static int RealMain(int argc, wchar_t** argv)
         cfg.modsMarker    = ReadIni(L"mods_marker", L"INDOMITUS MOD LAUNCHER");
         cfg.modsExclusive = ReadIni(L"mods_exclusive", L"0") == L"1";
         cfg.modsProfile   = ReadIni(L"mods_profile");
-        cfg.hotkeys       = ReadIni(L"hotkeys", L"actions/melee_toggle=DOUBLE + KEY_M;actions/overcharge=DOUBLE + KEY_O;actions/jetpack=DOUBLE + KEY_J;actions/sacrifice=DOUBLE + KEY_K;actions/activate_drop=SHIFT + KEY_SPACE");
+        cfg.hotkeys       = ReadIni(L"hotkeys", L"actions/melee_toggle=SHIFT + KEY_G;actions/overcharge=SHIFT + KEY_O;actions/jetpack=DOUBLE + KEY_J;actions/sacrifice=SHIFT + KEY_K;actions/activate_drop=SHIFT + KEY_SPACE");
         cfg.showModFolderButton = ReadIni(L"show_mod_folder_button", L"1") != L"0";
         cfg.showDisableModsButton = ReadIni(L"show_disable_mods_button", L"1") != L"0";
         cfg.version    = ReadIni(L"version");
