@@ -1,5 +1,5 @@
 @echo off
-rem GEM SensorTags 0.1 build - Indomitus Launcher payload dll
+rem GEM SensorTags 0.2 build - Indomitus Launcher payload dll
 rem   build.bat          -> dist\gem_sensortags.dll + dist\gem_sensortags.ini
 rem   build.bat payload  -> the above, then copies both into ..\..\launcher\payload\
 rem   build.bat test     -> dist\st_test.exe, finders on the game / editor / server exe (one exe per run)

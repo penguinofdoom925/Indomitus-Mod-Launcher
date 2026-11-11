@@ -1,4 +1,4 @@
-# GEM SensorTags 0.1
+# GEM SensorTags 0.2
 
 While a unit (human, vehicle, gun) carries the entity tag `sensor_off`, its sensor is off:
 it sees nothing, spots nothing for its side, and its seen list is dropped. This is the same state
@@ -12,7 +12,8 @@ Remove the tag and the sensor comes back in whatever state the engine wants for 
 ```
 
 - Any way of setting the tag works: script `{tags add/remove}`, spawn defines, triggers, other dlls.
-- The tag is read every tick, so the switch takes effect on the unit's next update.
+- The tag is read on a unit's first tick and then once per `CheckMs` (ini, default 1000 ms; 0 = every tick,
+  as 0.1 did). A unit that spawns tagged is blind at once; a tag added or removed later acts within `CheckMs`.
 - Each actor has its own sensor. Tagging a vehicle switches off the vehicle's visors (driver, gunner,
   commander sights). Crew humans have their own sensors (usually already off in closed seats).
 - Units without a `{sensor}` block are not affected.
@@ -21,7 +22,7 @@ Remove the tag and the sensor comes back in whatever state the engine wants for 
 | File | |
 |---|---|
 | `gem_sensortags.dll` | the dll (game, editor and dedicated server) |
-| `gem_sensortags.ini` | `Enabled`, `Tag` (default `sensor_off`), `Log` |
+| `gem_sensortags.ini` | `Enabled`, `Tag` (default `sensor_off`), `Log`, `CheckMs` (default 1000) |
 | `gem_sensortags.log` | written next to the dll (`_editor` / `_server` suffix for those exes) |
 
 ## Install
@@ -42,6 +43,7 @@ only if they can host. The dll leaves the client-side sensor class alone.
   SetSenseless, control-mode changes.
 - The dll patches two `eSensor` vtable slots: the sensor quant (+0x68, called every actor tick) and
   the clear slot (+0x58).
+  The quant hook only looks at the unit's tags once per `CheckMs` (0.2); the clear hook looks every time.
 - While tagged, the byte holds 2 + the engine's value (2 or 3). Readers see non-zero = off. Writers
   compare 2/3 with 0/1, so they always write and call clear; the clear hook keeps the value the engine
   just wrote and holds the sensor off again. When the tag goes, the quant hook writes the engine's

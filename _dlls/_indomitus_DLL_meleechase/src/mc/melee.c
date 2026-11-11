@@ -533,6 +533,41 @@ typedef struct { uint8_t *ent; void *tgt; float x, y, vx, vy; uint32_t t; } Trac
 #define MAX_TRACK 1024
 static Track g_tr[MAX_TRACK];
 
+/* ---- 0.5.2: both tables are emptied when a new mission starts ---- */
+/* The chase table names orders, units and brains of the running scene. A slot is freed by the order's own stop step
+   or destructor (mt_update / mt_dtor); an order that goes away with its whole scene runs neither, so its slot stayed
+   used into the next mission. Two effects: g_chLive stayed above 0 for the rest of the session (every eMoveTask
+   update of every unit then took the lock and searched the table), and a new order allocated at a stale slot's
+   address was taken for the old one, with mt_update reading that slot's dead brain and unit. GEM MeleeStance needed
+   the same reset in 0.7.31 (dedicated server crash right after a match ended).
+   "New mission" = the simulation clock is not where the last hooked call left it: it stepped back (restart, next
+   map, a save from earlier), or it jumped ahead by more than EPOCH_GAP_MS (a save from later). Within one mission
+   some hooked call runs every quant while a chase is live, and a quant is well under 100 ms, so a live chase never
+   sees such a gap. The rule only reads the simulation clock, so every machine of a network game resets on the same
+   quant. Caller must NOT hold g_cs. */
+#define EPOCH_GAP_MS 5000
+static volatile uint32_t g_epochLast;                                  /* clock at the last check, 0 = none yet */
+static volatile LONG g_epochLogged;
+static int epoch_changed(uint32_t last, uint32_t now) { return last && (uint32_t)(now - last) > EPOCH_GAP_MS; }
+static void mission_check(void)
+{
+    uint32_t now = *g_simTime, last = g_epochLast;
+    if (epoch_changed(last, now)) {
+        EnterCriticalSection(&g_cs);
+        if (epoch_changed(g_epochLast, now)) {                         /* not done by another thread meanwhile */
+            int live = (int)g_chLive;
+            memset(g_ch, 0, sizeof g_ch); g_chHigh = 0; InterlockedExchange(&g_chLive, 0);
+            memset(g_tr, 0, sizeof g_tr);
+            g_epochLast = now ? now : 1;
+            if (g_logChase && InterlockedIncrement(&g_epochLogged) <= 20)
+                logf_("simulation clock %u -> %u ms: new mission, chase table cleared (%d slot(s) were still in use)", last, now, live);
+        }
+        LeaveCriticalSection(&g_cs);
+        return;
+    }
+    g_epochLast = now ? now : 1;
+}
+
 /* caller holds g_cs. Velocity in world units per second, smoothed; 0 for a new target. Only floats are kept: the target
    pointer is compared, never dereferenced. */
 static void track(uint8_t *e, uint8_t *rec, float *vx, float *vy)
@@ -662,6 +697,7 @@ static void log_no_melee(uint8_t *e)
 static uint64_t vs_tick(void *s, uint64_t a, uint64_t b, uint64_t c)
 {
     t_chase = 0; t_haveV = 0; t_mel = 0;
+    mission_check();                                                    /* 0.5.2 */
     uint8_t *brain = *(uint8_t **)((uint8_t *)s + o_vStateBrain);
     uint8_t *e = brain ? *(uint8_t **)(brain + o_vBrainEntity) : NULL;
     if (e && !(e[ENT_FLAGS] & 4) && (e[ENT_FLAGS] & 2)) {
@@ -735,6 +771,8 @@ static uint64_t vs_tick(void *s, uint64_t a, uint64_t b, uint64_t c)
 
 static uint64_t mt_update(void *o, uint64_t phase, uint64_t a, uint64_t b)
 {
+    if (!g_chLive) return g_mtUpdateOrig(o, phase, a, b);
+    mission_check();                                                    /* 0.5.2: a mission without vehicles never runs vs_tick */
     if (!g_chLive) return g_mtUpdateOrig(o, phase, a, b);
     EnterCriticalSection(&g_cs);
     int i = ch_find(o);

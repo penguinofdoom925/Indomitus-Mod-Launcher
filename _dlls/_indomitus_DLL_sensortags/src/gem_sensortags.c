@@ -1,4 +1,4 @@
-/* GEM SensorTags 0.1 - switch a unit's sensor off with an entity tag (Call to Arms: Gates of Hell, GEM 2, 1.067)
+/* GEM SensorTags 0.2 - switch a unit's sensor off with an entity tag (Call to Arms: Gates of Hell, GEM 2, 1.067)
  *
  * While an actor (human, vehicle, gun) carries the tag "sensor_off" (ini Tag=), its sensor is off:
  * it sees nothing, spots nothing, its seen list is cleared. Remove the tag and the sensor comes back
@@ -23,6 +23,10 @@
  * MP: sensing runs on the host only (clients use eSensorClient, whose quant is a no-op, and get the
  * seen lists from the host), so the host (game or call_to_arms_server.exe) must run the dll.
  * Only the eSensor vtable is patched; eSensorClient is left alone.
+ * 0.2 (Alex, Nov 11 2026): the quant hook looks for the tag once per CheckMs per sensor (ini, default 1000;
+ *   0 = every quant, as 0.1 did), always on a sensor's first quant. So a unit that spawns tagged is blind from its
+ *   first tick, and a tag added or removed later acts within CheckMs. An engine write of the off byte still goes
+ *   through the clear hook at once, tag test included, so a held sensor is never switched on in between.
  *
  * Build: build.bat   Offline finder + logic test: build.bat test
  */
@@ -34,7 +38,7 @@
 #include <stdarg.h>
 #include <ctype.h>
 
-#define ST_VERSION "0.1"
+#define ST_VERSION "0.2"
 #define ST_SECT    "SensorTags"
 
 typedef struct { union { char buf[16]; char *ptr; } u; size_t size, cap; } MsString;
@@ -43,6 +47,7 @@ typedef struct { union { char buf[16]; char *ptr; } u; size_t size, cap; } MsStr
 static int  cfg_enabled = 1, cfg_log = 0;
 static char cfg_tag[48] = "sensor_off";
 static size_t cfg_taglen = 10;
+static uint32_t cfg_check_ms = 1000;        /* 0.2 [SensorTags] CheckMs: ms between two looks at one unit's tags; 0 = every quant */
 
 /* ---------------------------------------------------------------- log */
 static char  g_logpath[MAX_PATH];
@@ -281,10 +286,40 @@ static void sync(uint8_t *s, uint8_t *e)
     }
 }
 
+/* 0.2: is this sensor's tag check due? One slot per sensor address, direct-mapped: the sensor last checked through
+   that slot and when. A sensor not in its slot is always due (its first quant, or another sensor shares the slot:
+   then both are simply checked on every quant, as 0.1 did for everyone), so a check can come early but never more
+   than CheckMs late. The address is only compared, never read through. A new sensor that lands on the address of
+   one checked less than CheckMs ago waits out the rest of that window; that is the one case where the first check is
+   not at once. Wall-clock time: sensing runs on the host only, so nothing here has to match another machine. */
+#ifdef ST_TEST
+static uint32_t g_test_now;                 /* the test's clock */
+static int g_syncs;                         /* tag checks done from the quant hook */
+#define st_now() g_test_now
+#else
+#define st_now() ((uint32_t)GetTickCount())
+#endif
+#define NCHK 4096
+static struct { uint8_t *s; uint32_t at; } g_chk[NCHK];
+static uint32_t chk_slot(const uint8_t *s) { return ((uint32_t)((uintptr_t)s >> 4) * 2654435761u) >> 20; }   /* top 12 bits */
+static int check_due(uint8_t *s)
+{
+    if (!cfg_check_ms) return 1;
+    uint32_t now = st_now(), h = chk_slot(s);
+    if (g_chk[h].s == s && (uint32_t)(now - g_chk[h].at) < cfg_check_ms) return 0;
+    g_chk[h].s = s; g_chk[h].at = now;
+    return 1;
+}
+
 static uint64_t hk_quant(void *sv)
 {
     uint8_t *s = sv, *e = owner_of(s);
-    if (e) sync(s, e);
+    if (e && check_due(s)) {
+#ifdef ST_TEST
+        g_syncs++;
+#endif
+        sync(s, e);
+    }
     return orig_quant(sv);
 }
 
@@ -309,6 +344,8 @@ static void load_ini(const char *ini)
     char buf[64];
     cfg_enabled = GetPrivateProfileIntA(ST_SECT, "Enabled", 1, ini);
     cfg_log     = GetPrivateProfileIntA(ST_SECT, "Log", 0, ini);
+    int ms      = (int)GetPrivateProfileIntA(ST_SECT, "CheckMs", 1000, ini);                /* 0.2 */
+    cfg_check_ms = ms < 0 ? 0 : ms > 60000 ? 60000 : (uint32_t)ms;
     GetPrivateProfileStringA(ST_SECT, "Tag", cfg_tag, buf, sizeof buf, ini);
     size_t n = strlen(buf);
     while (n && (buf[n - 1] == ' ' || buf[n - 1] == '\t')) buf[--n] = 0;
@@ -339,9 +376,9 @@ static void install(void)
         logf_("[GEM SensorTags] VirtualProtect failed (%lu)", GetLastError()); return;
     }
     logf_("[GEM SensorTags %s] installed | eSensor vtable exe+0x%llX quant slot %u exe+0x%llX clear slot %u exe+0x%llX | "
-          "off +0x%X owner +0x%X actor sensor +0x%X tags +0x%X | Tag=%s Log=%d",
+          "off +0x%X owner +0x%X actor sensor +0x%X tags +0x%X | Tag=%s Log=%d CheckMs=%u%s",
           ST_VERSION, OFF(vt_sensor), s_quant, OFF(f_quant), SLOT_CLEAR, OFF(f_clear),
-          o_off, o_owner, o_sensor, o_tags, cfg_tag, cfg_log);
+          o_off, o_owner, o_sensor, o_tags, cfg_tag, cfg_log, cfg_check_ms, cfg_check_ms ? "" : " (every quant)");
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res)
@@ -401,6 +438,7 @@ int main(int argc, char **argv)
     } else { o_off = 0x18; o_owner = 0x260; o_sensor = 0xDD0; o_tags = 0x1D0; }
 
     orig_clear = fake_clear; orig_quant = fake_quant;
+    cfg_check_ms = 0;                                                    /* the 0.1 table below: a check on every quant */
     *(uint8_t **)(g_sensor + o_owner) = g_actor; *(uint8_t **)(g_actor + o_sensor) = g_sensor;
     const char *on[] = { "soldier", "sensor_off" }, *off[] = { "soldier" };
     struct { const char *what; int tag; int write; uint8_t want; int clears; } st[] = {
@@ -429,6 +467,44 @@ int main(int argc, char **argv)
     set_tags(2, on); g_sensor[o_off] = 0; hk_quant(g_sensor);
     printf("  %-32s byte %d %s\n", "foreign owner ignored", g_sensor[o_off], g_sensor[o_off] == 0 ? "OK" : "FAIL");
     if (g_sensor[o_off]) bad = 1;
+
+    /* 0.2 CheckMs: looked at on the first quant, then once per CheckMs; engine writes still act at once */
+    {
+        #define CK(what, cond) do { int ok_ = (cond); printf("  %-48s byte %d %s\n", what, g_sensor[o_off], ok_ ? "OK" : "FAIL"); if (!ok_) bad = 1; } while (0)
+        *(uint8_t **)(g_actor + o_sensor) = g_sensor;
+        cfg_check_ms = 1000; memset(g_chk, 0, sizeof g_chk); g_test_now = 50000;
+        set_tags(2, on); g_sensor[o_off] = 0; hk_quant(g_sensor);
+        CK("CheckMs: spawned tagged, first quant -> 2", g_sensor[o_off] == 2);
+        set_tags(1, off); g_test_now += 400; hk_quant(g_sensor);
+        CK("CheckMs: tag removed, 400 ms later still 2", g_sensor[o_off] == 2);
+        g_test_now += 599; hk_quant(g_sensor);
+        CK("CheckMs: 999 ms later still 2", g_sensor[o_off] == 2);
+        g_test_now += 1; hk_quant(g_sensor);
+        CK("CheckMs: 1000 ms later back on (0)", g_sensor[o_off] == 0);
+        set_tags(2, on); g_test_now += 999; hk_quant(g_sensor);
+        CK("CheckMs: tag added, 999 ms later still 0", g_sensor[o_off] == 0);
+        g_test_now += 1; hk_quant(g_sensor);
+        CK("CheckMs: 1000 ms later held (2)", g_sensor[o_off] == 2);
+        g_test_now += 10; engine_write(1);
+        CK("CheckMs: engine write while held -> 3 at once", g_sensor[o_off] == 3);
+        set_tags(1, off); g_test_now += 1000; hk_quant(g_sensor);
+        CK("CheckMs: tag gone -> engine value (1)", g_sensor[o_off] == 1);
+        set_tags(2, on); g_test_now += 10; engine_write(0);
+        CK("CheckMs: tag added + engine write -> 2 at once", g_sensor[o_off] == 2);
+        set_tags(1, off); g_test_now += 2000; hk_quant(g_sensor); g_syncs = 0;
+        for (int i = 0; i < 1000; i++) { g_test_now += 10; hk_quant(g_sensor); }                /* 10 s of 10 ms quants */
+        CK("CheckMs: 1000 quants in 10 s = 10 tag checks", g_syncs == 10 && g_sensor[o_off] == 0);
+        uint8_t *other = g_sensor + 16;                                                        /* another sensor in the same slot */
+        while (chk_slot(other) != chk_slot(g_sensor)) other += 16;
+        int a1 = check_due(g_sensor), b1 = check_due(other), a2 = check_due(g_sensor), b2 = check_due(other);
+        CK("CheckMs: two sensors in one slot, both always due", a1 == 0 && b1 == 1 && a2 == 1 && b2 == 1);
+        memset(g_chk, 0, sizeof g_chk); g_test_now = 0xFFFFFE00u; int w1 = check_due(g_sensor);
+        g_test_now += 0x300; int w2 = check_due(g_sensor); g_test_now += 300; int w3 = check_due(g_sensor);
+        CK("CheckMs: tick counter wrap", w1 == 1 && w2 == 0 && w3 == 1);
+        cfg_check_ms = 0; g_syncs = 0; for (int i = 0; i < 5; i++) hk_quant(g_sensor);
+        CK("CheckMs=0: every quant", g_syncs == 5);
+        #undef CK
+    }
     printf(bad ? "SOME FAILED\n" : "ALL OK\n");
     return bad;
 }

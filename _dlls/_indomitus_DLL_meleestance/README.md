@@ -1,4 +1,24 @@
-# GEM MeleeStance 0.7.30
+# GEM MeleeStance 0.7.36
+
+## 0.7.31 - 0.7.35 (Nov 9-11 2026, short form; full notes in the comments of src\gem_meleestance.c and in the ini)
+- 0.7.31: all unit tables are cleared when the sim clock goes backwards (new mission). A finished mission's units stayed on the
+  poll list and crashed the dedicated server 1 s after `Exit game mode`.
+- 0.7.32: `IsManualControlled` is only called on a unit that has both components it reads (server crash 26 min in on a
+  half-removed unit).
+- 0.7.33: a weak ref is only trusted while the entity it names still lists it (a freed entity's ref crashed a player's game in
+  RefDtor); the answer is kept per sim clock value.
+- 0.7.34: `[MeleeStance] HookTiming`: the hook's own time, the order poll's share and the engine's share on the `hb:` line.
+- 0.7.35 (cost): Alex's Nov 10 match measured 22 us of dll time per weapon pick against 0.6 us for the engine's MatchAmmo
+  (2.6 million picks, 57 s). No behaviour removed:
+  - with the quant hook in, the charge queue, the draw queue and the order poll run from the tick only, not on every pick;
+  - `FastPass`: a pick by a unit known to carry no melee weapon goes straight to the engine (after the target checks), and the
+    known-units table has a 200 ms "already noted" cache in front of its 256-slot search;
+  - `DiagManual` is off by default (it made VirtualQuery calls on every pick);
+  - `ClientGate`: the tick and the order poll stay idle until the engine has asked this process for a weapon pick (the client
+    of a hosted game never gets one; its poll cost 1.5 ms a tick).
+  `hb:` line: new `fast pass N` and `gated N` counters. Self-test: `0.7.35:` line (11 cases).
+- 0.7.36: `[AutoDraw] PlayerUnits=0` is the default and covers every fight-range path (scan, order picks, order poll): a
+  human player's units are never swapped by the dll; the melee toggle is their switch. Bots keep the automatic swap.
 
 ## 0.7.19 - 0.7.30 (Nov 9 2026, short form; full notes in the comments of src\gem_meleestance.c and in the ini)
 - 0.7.19-0.7.23: the dll runs its own tick at the start of every simulation quant (`Scene::eQuantExecutor` slot hook), because

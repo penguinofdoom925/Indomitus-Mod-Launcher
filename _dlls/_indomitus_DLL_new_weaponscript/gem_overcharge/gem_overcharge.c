@@ -16,7 +16,7 @@
  * with GEM Converge / GEM Guidance; makes sure the right magazine is in when a bullet is created).
  */
 #define GEM_NAME    "GEM Overcharge"
-#define GEM_VERSION "1.1"
+#define GEM_VERSION "1.1.1"
 #define GEM_SECT    L"overcharge"
 #include "../common/gem_common.h"
 
@@ -353,10 +353,26 @@ static int oc_resolve(void *shooter, OcCtx *c)
     return 1;
 }
 
+/* Null-ammo guard (1.1.1): the engine's SpawnBullet reads [weapon+ammo] (eAmmo*) with no null check, and Launch only
+   tests weapon->stuff. A weapon whose eAmmo is gone (holder killed / gun unlinked or deleted with a direct-control fire
+   input still queued: client crash Nov 10 2026, exe+0x80BF96) must not fire: the shot is dropped, 0 = "nothing launched",
+   which both callers already handle. */
+static int g_ocNoAmmoLog = 10;
+static int oc_no_ammo(void *shooter, const char *where)
+{
+    const uint8_t *weapon = NULL, *ammo = NULL;
+    if (!g_weaponAmmoOff || !shooter) return 0;
+    if (!rd_mem((const uint8_t *)shooter + g_weaponOff, &weapon, 8) || !weapon) return 0;
+    if (!rd_mem(weapon + g_weaponAmmoOff, &ammo, 8) || ammo) return 0;
+    if (g_ocNoAmmoLog > 0) { g_ocNoAmmoLog--; logf_("guard: %s on a weapon with no eAmmo (shooter %p, weapon %p): shot dropped", where, shooter, (const void *)weapon); }
+    return 1;
+}
+
 /* SpawnBullet: make sure the right magazine is in when a bullet is created (a SyncedProjectiles spawn could run
    outside Launch); never swaps back while tagged */
 static char hook_spawn_bullet(void *shooter, int syncIdx, float *zero, float *dir)
 {
+    if (oc_no_ammo(shooter, "SpawnBullet")) return 0;
     g_ocSpawnCalls++;
     OcCtx c;
     if (oc_resolve(shooter, &c)) {
@@ -372,6 +388,7 @@ static char hook_spawn_bullet(void *shooter, int syncIdx, float *zero, float *di
 static char hook_launch(void *shooter)
 {
     OcCtx c;
+    if (oc_no_ammo(shooter, "Launch")) return 0;
     if (!oc_resolve(shooter, &c)) return g_launchOrig(shooter);
     if (!c.tagged) {
         if (c.cur == c.sib && c.base && c.cur != c.base) {

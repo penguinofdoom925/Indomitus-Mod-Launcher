@@ -48,7 +48,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-#define MS_VERSION "0.7.34"
+#define MS_VERSION "0.7.36"
 #define MAXT 24
 #define TLEN 48
 
@@ -190,6 +190,7 @@ static uint32_t st_reject, st_allow, st_charge_q, st_charge_go, st_charge_drop;
  * nothing from a fight): how often the engine calls the hook at all. A background thread only reads these and writes the log
  * (no engine calls) every 5 s while they change, so a silent log now says whether the engine asked anything. */
 static volatile LONG st_hk_all, st_hk_scan, st_hk_human, st_hk_enemy, st_hk_polls;
+static volatile LONG st_fast;              /* 0.7.35: picks passed straight to the engine (fast_nomelee) */
 
 enum { PASS = 0, REJECT = 1, MELEE = 2 };
 
@@ -236,7 +237,18 @@ static int is_linked(const uint8_t *ent) { return cfg_skip_linked && ((*(const u
  * while they have seen enemy infantry within [Charge] MaxDistance in the last InfantryMs, so infantry comes first.
  * An attack / melee order on a vehicle at the front of the unit's order queue that the dll did not add (the player's
  * click) overrides that, and the charge leaves that unit on its vehicle. */
-static int   cfg_ad_on = 1, cfg_ad_player = 1;
+static int   cfg_ad_on = 1, cfg_ad_player = 0;
+/* 0.7.36 (Alex, Nov 11 2026: no automatic weapon swap on his own units; the wish was "not while I have them selected", but
+ * selection is client-side UI state the server never sees, so the rule is the owner): [AutoDraw] PlayerUnits=0 now covers every
+ * fight-range path - the scan (was already), the order-pick path and the order poll (were not) - and is the default. A human
+ * player's unit (brain control = user, the {if user_control} test) is never probed, drawn for, held off its guns or sent back
+ * to its gun by the dll; its switch is the melee toggle (stance, charge and [Zerg] are other settings and unchanged). */
+static int ad_player_skip(const uint8_t *ent)
+{
+    if (cfg_ad_player) return 0;
+    const uint8_t *br = *(const uint8_t *const *)(ent + 0xDC8);
+    return br && (br[0x398] & 3) == 1;
+}
 static float cfg_ad_dist = 100.0f;
 static uint32_t cfg_ad_hold = 3000;
 /* 0.7.16 probe (Alex's Nov 8 dump: the engine never offered a belt melee weapon while a gun was in hand - the ammo.set gun rows
@@ -405,7 +417,7 @@ static void manual_log(const uint8_t *ent, int prop, int mgr)
  * separately - the DE0 property value (+0x18), the DD8 +0x70 bit 1 (the two halves of IsManualControlled), IsManualControlled itself,
  * and whether the manager's +0x3B0 is this unit. When IsManualControlled is on but the manager does not name the unit, the manager
  * object's first 0x1000 bytes are searched for the unit pointer (to find the right offset). [MeleeStance] DiagManual, 300 lines/mission. */
-static int cfg_manual_diag = 1;
+static int cfg_manual_diag = 0;          /* 0.7.35: off by default - manual_diag() makes a VirtualQuery call per weapon pick */
 static int g_mdiag;
 static int readable(const void *p, size_t n)
 {
@@ -1228,6 +1240,7 @@ static int order_pick(const uint8_t *ctx, const uint8_t *ret)
     uint8_t *ent = *(uint8_t *const *)(ctx + 8);
     const uint8_t *ti = *(const uint8_t *const *)(ctx + 0x10);
     if (!ent || !ti || !(ent[0x30] & 0x04) || is_linked(ent) || in_manual(ent)) return 0;
+    if (ad_player_skip(ent) && !tag_stance(ent)) return 0;                      /* 0.7.36 */
     const uint8_t *tgt = *(const uint8_t *const *)(ti + 0x18);
     if (!tgt || tgt == ent || !(tgt[0x30] & 0x04) || tgt[0xDA8] == ent[0xDA8] || linked_raw(tgt)) return 0;
     float dx = *(const float *)(ent + 0x74) - *(const float *)(ti + 0x28);
@@ -1285,10 +1298,24 @@ static known_t g_known[NKNOWN];
 static int cfg_poll_on = 1;                /* [AutoDraw] OrderPoll */
 static uint32_t cfg_poll_ms = 250;         /* [AutoDraw] PollMs */
 static uint32_t cfg_blind_ms = 8000;       /* 0.7.19 [AutoDraw] BlindCheckMs: a draw tried without knowing is judged after this */
-static uint32_t st_poll_fight, st_poll_draw, st_poll_unknown;
+static uint32_t st_poll_fight, st_poll_draw, st_poll_unknown, st_poll_player;
 static int g_polllines, g_ovtlines;
+/* 0.7.35: known_note() runs twice per weapon pick (the scanning unit and its target) and searched all NKNOWN slots each time
+ * (288 bytes apart: ~70 KB walked twice a call; Alex's Nov 10 Beta 3 match: 2.6 million picks, 22 us of dll time each against
+ * 0.6 us for the engine's own MatchAmmo). A direct-mapped table of "noted at" times in front of it: a unit noted less than
+ * KCACHE_MS ago is not looked up again (its slot's time is at most that stale, which the least-recently-seen eviction does not
+ * notice). A unit dropped from the table inside that window is simply noted again after it. */
+#define NKCACHE 1024
+#define KCACHE_MS 200
+static struct { const uint8_t *unit; uint32_t ms; } g_kcache[NKCACHE];
+static int cfg_kcache = 1;                 /* [MeleeStance] FastPass */
 static void known_note(uint8_t *ent, uint32_t now)
 {
+    if (cfg_kcache) {
+        uint32_t ch = (uint32_t)(((uintptr_t)ent >> 4) * 2654435761u) % NKCACHE;
+        if (g_kcache[ch].unit == ent && (uint32_t)(now - g_kcache[ch].ms) < KCACHE_MS) return;
+        g_kcache[ch].unit = ent; g_kcache[ch].ms = now;
+    }
     known_t *free_ = NULL, *old = NULL;
     for (int i = 0; i < NKNOWN; i++) {
         known_t *k = &g_known[i];
@@ -1414,6 +1441,7 @@ static void order_poll(const uint8_t *scanning, uint32_t now)
         uint8_t *u = live[i];
         if (!u) continue;
         if (u == scanning || !(u[0x30] & 0x04) || is_linked(u) || in_manual(u)) continue;
+        if (ad_player_skip(u) && !tag_stance(u)) { st_poll_player++; continue; }   /* 0.7.36: still listed (he is others' enemy), left alone */
         const uint8_t *o = (const uint8_t *)front_order(u);
         void **vt = o ? *(void **const *)o : NULL;
         /* 0.7.20 (0.7.19 test: no poll line for a unit on a right-click attack order): log every change of a unit's front order
@@ -1530,11 +1558,17 @@ static uint32_t cfg_tick_ms = 100;         /* [AutoDraw] TickMs */
 static volatile DWORD g_sim_tid, g_ui_tid;
 static volatile LONG g_in_hook, g_in_tick, st_ticks, st_tick_wrongthread;
 static DWORD g_tick_wall; static uint32_t g_tick_clock;
+static int cfg_gate = 1;                   /* 0.7.35 [MeleeStance] ClientGate */
+static volatile LONG st_tick_gated;
 static volatile LONG64 st_tick_us;         /* 0.7.25: time spent in the tick's work, microseconds (heartbeat) */
 static volatile LONG st_tick_us_max;
 static void ms_tick(void)
 {
     if (!cfg_tick_on || !g_clock || g_in_hook || g_in_tick) return;
+    /* 0.7.35 client gate: the engine has not asked this process for one weapon pick = the simulation runs somewhere else (the
+     * client of a hosted game: Alex's Nov 10 client log, hook calls 0, yet 19000 polls fed by 72000 order events cost 1.5 ms a
+     * tick). Nothing the tick does can have an effect there. The first pick opens the gate for the rest of the session. */
+    if (cfg_gate && !st_hk_all) { st_tick_gated++; return; }
     DWORD t = GetTickCount();
     if (t - g_tick_wall < cfg_tick_ms / 2) return;
     g_tick_wall = t;
@@ -1669,6 +1703,7 @@ static void order_event(void *entity, void *order)
     if (!g_ui_tid) g_ui_tid = GetCurrentThreadId();
     frame_hook_try();                                           /* 0.7.23: first call on the engine thread finds the frame function */
     st_order_events++;
+    if (cfg_gate && !st_hk_all) return;                         /* 0.7.35: see ms_tick (the quant hook above still goes in: other dlls' quant callbacks) */
     known_note(e, *g_clock);
     g_poll_last = 0;                                            /* poll on the next tick, not after PollMs */
 }
@@ -1712,10 +1747,10 @@ static DWORD WINAPI hb_thread(LPVOID p)
         LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
         LONG hmx = InterlockedExchange(&st_hook_qpc_max, 0), hn = st_hook_timed;
         long long hq = st_hook_qpc, oq = st_orig_qpc, pq = st_hpoll_qpc, f = qf.QuadPart ? qf.QuadPart : 1;
-        logf_("hb: [%u ms] hook calls %ld (scan %ld, humans %ld, human vs enemy human %ld) | frame hook %s, ticks %ld (wrong thread %ld; sim %lu ui %lu) polls %ld, order events %ld, units on the poll list %d | tick cost: %lld us total, %ld us average, %ld us worst since the last line"
+        logf_("hb: [%u ms] hook calls %ld (scan %ld, humans %ld, human vs enemy human %ld, fast pass %ld) | frame hook %s, ticks %ld (gated %ld, wrong thread %ld; sim %lu ui %lu) polls %ld, order events %ld, units on the poll list %d | tick cost: %lld us total, %ld us average, %ld us worst since the last line"
               " | hook cost: %lld us total over %ld timed calls (%lld us of it the order poll), %lld ns average, %lld us worst since the last line; engine MatchAmmo %lld us total",
-              g_clock ? *g_clock : 0, all, (LONG)st_hk_scan, (LONG)st_hk_human, (LONG)st_hk_enemy,
-              g_frame_state == 1 ? "ON" : g_frame_state == 2 ? "FAILED" : "not tried yet", tk, (LONG)st_tick_wrongthread,
+              g_clock ? *g_clock : 0, all, (LONG)st_hk_scan, (LONG)st_hk_human, (LONG)st_hk_enemy, (LONG)st_fast,
+              g_frame_state == 1 ? "ON" : g_frame_state == 2 ? "FAILED" : "not tried yet", tk, (LONG)st_tick_gated, (LONG)st_tick_wrongthread,
               (DWORD)g_sim_tid, (DWORD)g_ui_tid, (LONG)st_hk_polls, (LONG)st_order_events, known,
               (long long)st_tick_us, tk ? (LONG)(st_tick_us / tk) : 0, mx,
               hq * 1000000 / f, hn, pq * 1000000 / f, hn ? hq * 1000000000 / f / hn : 0, (long long)hmx * 1000000 / f, oq * 1000000 / f);
@@ -1723,6 +1758,25 @@ static DWORD WINAPI hb_thread(LPVOID p)
     return 0;
 }
 static void hook_leave(int *x) { (void)x; g_in_hook--; }
+/* 0.7.35 fast pass. Most units in a match carry no melee weapon, and for them every branch below ends in "engine's choice":
+ * the probe / button already said so (nomelee_until, NoMeleeMs) and nothing is pending. Such a pick goes to the engine after
+ * the checks that concern the TARGET (ignored / downed) and the known-units upkeep (he is still somebody's enemy); scan_note,
+ * the order-pick path, the direct-control test and ms_decide are skipped. A melee ammo candidate is never fast: that is how a
+ * unit that picked a sword up is noticed (melee_known clears nomelee_until). [MeleeStance] FastPass */
+static int fast_nomelee(const uint8_t *ctx)
+{
+    if (!cfg_kcache || !cfg_enabled || !g_clock) return 0;
+    const uint8_t *ammo = *(const uint8_t *const *)ctx, *ent = *(const uint8_t *const *)(ctx + 8);
+    if (!ammo || !ent || !(ent[0x30] & 0x04)) return 0;
+    unit_t *s = unit_of(ent, 0);
+    uint32_t now = *g_clock;
+    if (!s || !s->nomelee_until || (int32_t)(s->nomelee_until - now) <= 0) return 0;
+    if (s->probe_ms || s->blind_ms) return 0;
+    if (s->ad_until && (int32_t)(s->ad_until - now) > 0) return 0;
+    if (s->melee_until && (int32_t)(s->melee_until - now) > 0) return 0;
+    if (vec_has(ammo + cfg_ammotags + TAGS_VEC, cfg_mtags, n_mtags) != 0) return 0;
+    return 1;
+}
 
 static void *ms_hook_body(uint8_t *ctx, uint8_t *ret);
 __attribute__((used, ms_abi, noinline)) void *ms_hook(uint8_t *ctx)
@@ -1743,13 +1797,18 @@ static __attribute__((noinline)) void *ms_hook_body(uint8_t *ctx, uint8_t *ret)
     g_in_hook++; int hook_guard __attribute__((cleanup(hook_leave), unused)) = 0;   /* 0.7.22: no tick inside the hook */
     if (from_scan && !g_sim_tid) g_sim_tid = GetCurrentThreadId();
     if (from_scan) frame_hook_try();                           /* 0.7.23 */
+    if (g_clock) log_epoch(*g_clock);                          /* 0.7.35: before any per-unit state is read (was in scan_note only) */
+    /* 0.7.35: with the quant hook in, ms_tick() flushes both queues and runs the order poll at the start of every quant, so the
+     * hook no longer walks them on every pick (64 + 32 slots, each a weak-ref check); without it (hook not found) as before */
+    int ticking = g_frame_state == 1 && cfg_tick_on;
+    int fast = fast_nomelee(ctx);
     {   /* 0.7.28: a target the dll must ignore (hidden / melee_disabled / call-ins) -> the engine picks on its own */
         const uint8_t *iti = *(const uint8_t *const *)(ctx + 0x10);
         const uint8_t *itg = iti ? *(const uint8_t *const *)(iti + 0x18) : NULL;
         if (itg && (itg[0x30] & 0x02) && ignored_target(itg)) { st_hk_all++; st_tgt_ignored++; return orig_timed(ctx); }
     }
-    if (from_scan && cfg_charge) charge_flush(*(uint8_t **)(ctx + 8));
-    if (from_scan && (cfg_ad_on || cfg_veh_on)) { autodraw_flush(*(uint8_t **)(ctx + 8)); scan_note(ctx); }
+    if (from_scan && cfg_charge && !ticking) charge_flush(*(uint8_t **)(ctx + 8));
+    if (from_scan && (cfg_ad_on || cfg_veh_on)) { if (!ticking) autodraw_flush(*(uint8_t **)(ctx + 8)); if (!fast) scan_note(ctx); }
     st_hk_all++; if (from_scan) st_hk_scan++;                  /* 0.7.21 heartbeat counters */
     {
         const uint8_t *he = *(const uint8_t *const *)(ctx + 8), *hti = *(const uint8_t *const *)(ctx + 0x10);
@@ -1766,7 +1825,8 @@ static __attribute__((noinline)) void *ms_hook_body(uint8_t *ctx, uint8_t *ret)
         uint8_t *st = sti ? *(uint8_t *const *)(sti + 0x18) : NULL;              /* order never scans, but the enemy's scans see it */
         if (st && st != su && (st[0x30] & 0x04) && !linked_raw(st) && cfg_poll_on) known_note(st, *g_clock);
         if (su && st && st != su && (su[0x30] & 0x04) && (st[0x30] & 0x04)) hostile_set(su[0xDA8], st[0xDA8]);   /* 0.7.24: an enemy scan's target is hostile */
-        if (cfg_hooktime) { LONGLONG pa = qpc_now(); order_poll(su, *g_clock); st_hpoll_qpc += qpc_now() - pa; }
+        if (ticking) { }                                       /* 0.7.35: the tick polls */
+        else if (cfg_hooktime) { LONGLONG pa = qpc_now(); order_poll(su, *g_clock); st_hpoll_qpc += qpc_now() - pa; }
         else order_poll(su, *g_clock);
     }
     if (!from_scan && cfg_log && g_rawlines < 40) {            /* 0.7.18: what reaches the hook from outside the scan, unfiltered */
@@ -1780,13 +1840,14 @@ static __attribute__((noinline)) void *ms_hook_body(uint8_t *ctx, uint8_t *ret)
         uint8_t *ou = *(uint8_t **)(ctx + 8);
         if (ou && (ou[0x30] & 0x04) && !is_linked(ou)) known_note(ou, *g_clock);
     }
-    int ord = !from_scan && order_pick(ctx, ret);              /* 0.7.17: an order's pick in fight range -> same path as the scan */
+    int ord = !fast && !from_scan && order_pick(ctx, ret);     /* 0.7.17: an order's pick in fight range -> same path as the scan */
     if (ord) scan_note(ctx);
     if (cfg_down_on) {                                        /* downed (personage) target: no weapon is usable against it */
         const uint8_t *ti = *(const uint8_t *const *)(ctx + 0x10);
         const uint8_t *tg = ti ? *(const uint8_t *const *)(ti + 0x18) : NULL;
         if (tg && (tg[0x30] & 0x04) && vec_has(tg + cfg_enttags, cfg_downtag, 1) == 1) { st_down++; return NULL; }
     }
+    if (fast) { st_fast++; return orig_timed(ctx); }           /* 0.7.35 */
     uint8_t ready = ctx[0x18];
     int d = ms_decide(ctx);
     void *r;
@@ -1992,6 +2053,7 @@ static void mission_flush(void)
     memset(g_last, 0, sizeof g_last);
     memset(g_dpend, 0, sizeof g_dpend);
     memset(g_known, 0, sizeof g_known);
+    memset(g_kcache, 0, sizeof g_kcache);
     memset(g_want, 0, sizeof g_want);
     memset(g_mine, 0, sizeof g_mine);
     memset(g_hostile, 0, sizeof g_hostile);
@@ -2697,8 +2759,10 @@ static void load_ini(const char *ini)
         GetPrivateProfileStringA("MeleeStance", "IgnoreTargetTags", "hidden,melee_disabled,valkyrie,sensor_off", sk, sizeof sk, ini);   /* 0.7.28 */
         n_tgttags = split_list(sk, cfg_tgttags, 8); }
     cfg_order_on = GetPrivateProfileIntA("AutoDraw", "OrderPicks", 1, ini);                  /* 0.7.17 */
-    cfg_manual_diag = GetPrivateProfileIntA("MeleeStance", "DiagManual", 1, ini);          /* 0.7.14 */
+    cfg_manual_diag = GetPrivateProfileIntA("MeleeStance", "DiagManual", 0, ini);          /* 0.7.14 */
     cfg_hooktime = GetPrivateProfileIntA("MeleeStance", "HookTiming", 1, ini);             /* 0.7.34 */
+    cfg_kcache = GetPrivateProfileIntA("MeleeStance", "FastPass", 1, ini);                 /* 0.7.35 */
+    cfg_gate = GetPrivateProfileIntA("MeleeStance", "ClientGate", 1, ini);                 /* 0.7.35 */
     GetPrivateProfileStringA("MeleeStance", "Tag", "melee_stance", cfg_tag, sizeof cfg_tag, ini);
     GetPrivateProfileStringA("MeleeStance", "MeleeAmmoTags",
         "melee_light,melee_heavy,medium_inf_melee_target,medium_veh_melee_target,heavy_veh_melee_target", buf, sizeof buf, ini);
@@ -2752,7 +2816,7 @@ static void load_ini(const char *ini)
     }
     GetPrivateProfileStringA("MeleeStance", "AlwaysTag", "melee_always", cfg_atag, sizeof cfg_atag, ini);
     cfg_ad_on     = GetPrivateProfileIntA("AutoDraw", "Enabled", 1, ini);
-    cfg_ad_player = GetPrivateProfileIntA("AutoDraw", "PlayerUnits", 1, ini);
+    cfg_ad_player = GetPrivateProfileIntA("AutoDraw", "PlayerUnits", 0, ini);
     cfg_ad_hold   = (uint32_t)GetPrivateProfileIntA("AutoDraw", "HoldMs", 3000, ini);
     GetPrivateProfileStringA("AutoDraw", "Distance", "100", buf, sizeof buf, ini);
     cfg_ad_dist = (float)atof(buf); if (cfg_ad_dist < 0.0f) cfg_ad_dist = 0.0f;
@@ -3542,6 +3606,76 @@ int main(int argc, char **argv)
         printf("stale refs: listed %d kept %d unlisted %d broken-list %d zeroed %d unmapped %d check-off %d -> %s\n",
                r1, r2, r3, r4, r5, r6, r7, r1 && r2 && r3 && r4 && r5 && r6 && r7 ? "OK" : "FAIL");
         if (!(r1 && r2 && r3 && r4 && r5 && r6 && r7)) fails++;
+    }
+    {   /* 0.7.35 self-test: fast pass, known-units cache, client gate, queues left to the tick */
+        static fake_t fu, fv; static uint8_t tf[0x40];
+        memset(&fu, 0, sizeof fu); fu.obj[0x30] = 6; fake_vec(fu.obj + cfg_enttags, fu.tags, "faction_ig", NULL, NULL);
+        memset(&fv, 0, sizeof fv); fv.obj[0x30] = 6; fake_vec(fv.obj + cfg_enttags, fv.tags, "faction_ig", NULL, NULL);
+        memset(tf, 0, sizeof tf); *(void **)(tf + 0x18) = enemy.obj; *(float *)(tf + 0x28) = 40.0f;
+        uint8_t cx[0x20] = { 0 }; *(void **)cx = bolter.obj; *(void **)(cx + 8) = fu.obj; *(void **)(cx + 0x10) = tf;
+        g_clock = &f_clock; f_clock += 100000;
+        unit_t *us = unit_of(fu.obj, 1); us->nomelee_until = f_clock + 20000;
+        LONG fa = st_fast; uint32_t pr = st_probe;
+        int q1 = ms_hook(cx) == (void *)0x1234 && st_fast == fa + 1 && st_probe == pr;      /* known "no melee": engine's choice, no probe */
+        *(void **)cx = sword.obj;
+        int q2 = ms_hook(cx) != NULL && st_fast == fa + 1 && unit_of(fu.obj, 1)->nomelee_until == 0;   /* melee ammo: full path, learnt */
+        *(void **)cx = bolter.obj; ms_hook(cx);
+        int q3 = st_fast == fa + 1;                                                          /* carries melee now: never fast */
+        cfg_kcache = 0; us = unit_of(fv.obj, 1); us->nomelee_until = f_clock + 20000; *(void **)(cx + 8) = fv.obj;
+        ms_hook(cx); int q4 = st_fast == fa + 1;                                             /* FastPass=0: full path */
+        cfg_kcache = 1;
+        /* known-units cache */
+        f_clock += 1000; known_note(fu.obj, f_clock);
+        int ks = -1; for (int i = 0; i < NKNOWN; i++) if (g_known[i].used && g_known[i].unit == fu.obj) ks = i;
+        int k1 = ks >= 0;
+        if (ks >= 0) { ref_free(g_known[ks].ref); g_known[ks].used = 0; }
+        known_note(fu.obj, f_clock + 10);
+        int k2 = 1; for (int i = 0; i < NKNOWN; i++) if (g_known[i].used && g_known[i].unit == fu.obj) k2 = 0;   /* inside KCACHE_MS: not looked up */
+        known_note(fu.obj, f_clock + KCACHE_MS);
+        int k3 = 0; for (int i = 0; i < NKNOWN; i++) if (g_known[i].used && g_known[i].unit == fu.obj) k3 = 1;   /* after it: noted again */
+        /* client gate: no weapon pick seen in this process -> the tick does nothing */
+        LONG all0 = st_hk_all, tk0 = st_ticks, gt0 = st_tick_gated;
+        cfg_tick_on = 1; g_sim_tid = GetCurrentThreadId(); f_clock += 1000;
+        st_hk_all = 0; g_tick_wall = 0; g_tick_clock = 0;
+        ms_tick(); int g1 = st_ticks == tk0 && st_tick_gated == gt0 + 1;
+        st_hk_all = 1; g_tick_wall = 0;
+        ms_tick(); int g2 = st_ticks == tk0 + 1;
+        st_hk_all = all0;
+        /* with the quant hook in, a scan pick leaves the charge queue to the tick; without it the hook flushes as before */
+        memset(g_pend, 0, sizeof g_pend);
+        pend_push(fu.obj, enemy.obj, 40.0f, 0, 0, f_clock);
+        int pi = -1; for (int i = 0; i < NPEND; i++) if (g_pend[i].used && g_pend[i].unit == fu.obj) pi = i;
+        g_scan_lo = (uint8_t *)1; g_scan_hi = (uint8_t *)(~(uintptr_t)0);                    /* every call counts as "from the scan" */
+        *(void **)(cx + 8) = fv.obj; f_clock += 50;
+        g_frame_state = 1; ms_hook(cx);
+        int t1 = pi >= 0 && g_pend[pi].used;                                                 /* ticking: still queued */
+        g_frame_state = 2; f_clock += 50; ms_hook(cx);
+        int t2 = pi >= 0 && !g_pend[pi].used;                                                /* no quant hook: flushed from the scan */
+        g_frame_state = 0; g_scan_lo = g_scan_hi = NULL;
+        int ok35 = q1 && q2 && q3 && q4 && k1 && k2 && k3 && g1 && g2 && t1 && t2;
+        printf("0.7.35: fast %d learn %d not-fast %d off %d | cache add %d hit %d expire %d | gate closed %d open %d | queue kept %d flushed %d -> %s\n",
+               q1, q2, q3, q4, k1, k2, k3, g1, g2, t1, t2, ok35 ? "OK" : "FAIL");
+        if (!ok35) fails++;
+    }
+    {   /* 0.7.36 self-test: PlayerUnits=0 - a human player's unit is not probed / swapped on the order-pick path or by the poll */
+        static fake_t pw; static uint8_t pwb[0x400], tw[0x40];
+        memset(&pw, 0, sizeof pw); pw.obj[0x30] = 6; fake_vec(pw.obj + cfg_enttags, pw.tags, "faction_sm", NULL, NULL);
+        memset(pwb, 0, sizeof pwb); pwb[0x398] = 1; *(uint8_t **)(pw.obj + 0xDC8) = pwb;      /* brain control = user */
+        memset(tw, 0, sizeof tw); *(void **)(tw + 0x18) = enemy.obj; *(float *)(tw + 0x28) = 40.0f;
+        uint8_t cw[0x20] = { 0 }; *(void **)cw = bolter.obj; *(void **)(cw + 8) = pw.obj; *(void **)(cw + 0x10) = tw;
+        g_clock = &f_clock; f_clock += 100000;
+        int sv = cfg_ad_player; uint32_t pr0 = st_probe, pp0 = st_poll_player;
+        cfg_ad_player = 0;
+        int w1 = ms_hook(cw) == (void *)0x1234 && st_probe == pr0;                           /* enemy at 2 m: gun passes, no probe */
+        cfg_poll_on = 1; cfg_ad_on = 1; g_poll_last = 0; known_note(pw.obj, f_clock);
+        if (!g_vt_attack) g_vt_attack = (void **)0x7777;
+        order_poll(NULL, f_clock);
+        int w2 = st_poll_player == pp0 + 1 && !unit_of(pw.obj, 1)->blind_ms && !unit_of(pw.obj, 1)->ad_until;   /* poll: listed, left alone */
+        cfg_ad_player = 1; f_clock += 10000;
+        int w3 = ms_hook(cw) == NULL && st_probe == pr0 + 1;                                 /* PlayerUnits=1: probed as before */
+        cfg_ad_player = sv;
+        printf("0.7.36: player unit pick left alone %d, poll left alone %d, PlayerUnits=1 probes %d -> %s\n", w1, w2, w3, w1 && w2 && w3 ? "OK" : "FAIL");
+        if (!(w1 && w2 && w3)) fails++;
     }
     printf("filter: %zu cases + 3 hook cases + charge, %d failed\n", sizeof c / sizeof c[0], fails);
     if (fails) bad = 1;

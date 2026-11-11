@@ -12,7 +12,7 @@
  * dlls did and chain on each other in the same way; the only change is the packaging.
  */
 #define GEM_NAME    "GEM WeaponScript"
-#define GEM_VERSION "1.1"
+#define GEM_VERSION "1.1.2"
 #define GEM_FILE    L"gem_weaponscript"
 #define GEM_SECT    L"weaponscript"
 #include "../common/gem_common.h"

@@ -50,7 +50,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-#define FX_VERSION "0.2.12"
+#define FX_VERSION "0.2.13"
 #define FX_NAME    "GEM Teleport"
 #define FX_INI     L"\\gem_teleport.ini"
 #define FX_LOG     L"\\gem_teleport.log"
