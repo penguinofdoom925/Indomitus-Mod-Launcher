@@ -1,4 +1,4 @@
-# GEM MeleeStance 0.7.35
+# GEM MeleeStance 0.7.36
 
 ## 0.7.31 - 0.7.35 (Nov 9-11 2026, short form; full notes in the comments of src\gem_meleestance.c and in the ini)
 - 0.7.31: all unit tables are cleared when the sim clock goes backwards (new mission). A finished mission's units stayed on the
@@ -17,6 +17,8 @@
   - `ClientGate`: the tick and the order poll stay idle until the engine has asked this process for a weapon pick (the client
     of a hosted game never gets one; its poll cost 1.5 ms a tick).
   `hb:` line: new `fast pass N` and `gated N` counters. Self-test: `0.7.35:` line (11 cases).
+- 0.7.36: `[AutoDraw] PlayerUnits=0` is the default and covers every fight-range path (scan, order picks, order poll): a
+  human player's units are never swapped by the dll; the melee toggle is their switch. Bots keep the automatic swap.
 
 ## 0.7.19 - 0.7.30 (Nov 9 2026, short form; full notes in the comments of src\gem_meleestance.c and in the ini)
 - 0.7.19-0.7.23: the dll runs its own tick at the start of every simulation quant (`Scene::eQuantExecutor` slot hook), because

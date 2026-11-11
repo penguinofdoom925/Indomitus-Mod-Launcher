@@ -48,7 +48,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-#define MS_VERSION "0.7.35"
+#define MS_VERSION "0.7.36"
 #define MAXT 24
 #define TLEN 48
 
@@ -237,7 +237,18 @@ static int is_linked(const uint8_t *ent) { return cfg_skip_linked && ((*(const u
  * while they have seen enemy infantry within [Charge] MaxDistance in the last InfantryMs, so infantry comes first.
  * An attack / melee order on a vehicle at the front of the unit's order queue that the dll did not add (the player's
  * click) overrides that, and the charge leaves that unit on its vehicle. */
-static int   cfg_ad_on = 1, cfg_ad_player = 1;
+static int   cfg_ad_on = 1, cfg_ad_player = 0;
+/* 0.7.36 (Alex, Nov 11 2026: no automatic weapon swap on his own units; the wish was "not while I have them selected", but
+ * selection is client-side UI state the server never sees, so the rule is the owner): [AutoDraw] PlayerUnits=0 now covers every
+ * fight-range path - the scan (was already), the order-pick path and the order poll (were not) - and is the default. A human
+ * player's unit (brain control = user, the {if user_control} test) is never probed, drawn for, held off its guns or sent back
+ * to its gun by the dll; its switch is the melee toggle (stance, charge and [Zerg] are other settings and unchanged). */
+static int ad_player_skip(const uint8_t *ent)
+{
+    if (cfg_ad_player) return 0;
+    const uint8_t *br = *(const uint8_t *const *)(ent + 0xDC8);
+    return br && (br[0x398] & 3) == 1;
+}
 static float cfg_ad_dist = 100.0f;
 static uint32_t cfg_ad_hold = 3000;
 /* 0.7.16 probe (Alex's Nov 8 dump: the engine never offered a belt melee weapon while a gun was in hand - the ammo.set gun rows
@@ -1229,6 +1240,7 @@ static int order_pick(const uint8_t *ctx, const uint8_t *ret)
     uint8_t *ent = *(uint8_t *const *)(ctx + 8);
     const uint8_t *ti = *(const uint8_t *const *)(ctx + 0x10);
     if (!ent || !ti || !(ent[0x30] & 0x04) || is_linked(ent) || in_manual(ent)) return 0;
+    if (ad_player_skip(ent) && !tag_stance(ent)) return 0;                      /* 0.7.36 */
     const uint8_t *tgt = *(const uint8_t *const *)(ti + 0x18);
     if (!tgt || tgt == ent || !(tgt[0x30] & 0x04) || tgt[0xDA8] == ent[0xDA8] || linked_raw(tgt)) return 0;
     float dx = *(const float *)(ent + 0x74) - *(const float *)(ti + 0x28);
@@ -1286,7 +1298,7 @@ static known_t g_known[NKNOWN];
 static int cfg_poll_on = 1;                /* [AutoDraw] OrderPoll */
 static uint32_t cfg_poll_ms = 250;         /* [AutoDraw] PollMs */
 static uint32_t cfg_blind_ms = 8000;       /* 0.7.19 [AutoDraw] BlindCheckMs: a draw tried without knowing is judged after this */
-static uint32_t st_poll_fight, st_poll_draw, st_poll_unknown;
+static uint32_t st_poll_fight, st_poll_draw, st_poll_unknown, st_poll_player;
 static int g_polllines, g_ovtlines;
 /* 0.7.35: known_note() runs twice per weapon pick (the scanning unit and its target) and searched all NKNOWN slots each time
  * (288 bytes apart: ~70 KB walked twice a call; Alex's Nov 10 Beta 3 match: 2.6 million picks, 22 us of dll time each against
@@ -1429,6 +1441,7 @@ static void order_poll(const uint8_t *scanning, uint32_t now)
         uint8_t *u = live[i];
         if (!u) continue;
         if (u == scanning || !(u[0x30] & 0x04) || is_linked(u) || in_manual(u)) continue;
+        if (ad_player_skip(u) && !tag_stance(u)) { st_poll_player++; continue; }   /* 0.7.36: still listed (he is others' enemy), left alone */
         const uint8_t *o = (const uint8_t *)front_order(u);
         void **vt = o ? *(void **const *)o : NULL;
         /* 0.7.20 (0.7.19 test: no poll line for a unit on a right-click attack order): log every change of a unit's front order
@@ -2803,7 +2816,7 @@ static void load_ini(const char *ini)
     }
     GetPrivateProfileStringA("MeleeStance", "AlwaysTag", "melee_always", cfg_atag, sizeof cfg_atag, ini);
     cfg_ad_on     = GetPrivateProfileIntA("AutoDraw", "Enabled", 1, ini);
-    cfg_ad_player = GetPrivateProfileIntA("AutoDraw", "PlayerUnits", 1, ini);
+    cfg_ad_player = GetPrivateProfileIntA("AutoDraw", "PlayerUnits", 0, ini);
     cfg_ad_hold   = (uint32_t)GetPrivateProfileIntA("AutoDraw", "HoldMs", 3000, ini);
     GetPrivateProfileStringA("AutoDraw", "Distance", "100", buf, sizeof buf, ini);
     cfg_ad_dist = (float)atof(buf); if (cfg_ad_dist < 0.0f) cfg_ad_dist = 0.0f;
@@ -3643,6 +3656,26 @@ int main(int argc, char **argv)
         printf("0.7.35: fast %d learn %d not-fast %d off %d | cache add %d hit %d expire %d | gate closed %d open %d | queue kept %d flushed %d -> %s\n",
                q1, q2, q3, q4, k1, k2, k3, g1, g2, t1, t2, ok35 ? "OK" : "FAIL");
         if (!ok35) fails++;
+    }
+    {   /* 0.7.36 self-test: PlayerUnits=0 - a human player's unit is not probed / swapped on the order-pick path or by the poll */
+        static fake_t pw; static uint8_t pwb[0x400], tw[0x40];
+        memset(&pw, 0, sizeof pw); pw.obj[0x30] = 6; fake_vec(pw.obj + cfg_enttags, pw.tags, "faction_sm", NULL, NULL);
+        memset(pwb, 0, sizeof pwb); pwb[0x398] = 1; *(uint8_t **)(pw.obj + 0xDC8) = pwb;      /* brain control = user */
+        memset(tw, 0, sizeof tw); *(void **)(tw + 0x18) = enemy.obj; *(float *)(tw + 0x28) = 40.0f;
+        uint8_t cw[0x20] = { 0 }; *(void **)cw = bolter.obj; *(void **)(cw + 8) = pw.obj; *(void **)(cw + 0x10) = tw;
+        g_clock = &f_clock; f_clock += 100000;
+        int sv = cfg_ad_player; uint32_t pr0 = st_probe, pp0 = st_poll_player;
+        cfg_ad_player = 0;
+        int w1 = ms_hook(cw) == (void *)0x1234 && st_probe == pr0;                           /* enemy at 2 m: gun passes, no probe */
+        cfg_poll_on = 1; cfg_ad_on = 1; g_poll_last = 0; known_note(pw.obj, f_clock);
+        if (!g_vt_attack) g_vt_attack = (void **)0x7777;
+        order_poll(NULL, f_clock);
+        int w2 = st_poll_player == pp0 + 1 && !unit_of(pw.obj, 1)->blind_ms && !unit_of(pw.obj, 1)->ad_until;   /* poll: listed, left alone */
+        cfg_ad_player = 1; f_clock += 10000;
+        int w3 = ms_hook(cw) == NULL && st_probe == pr0 + 1;                                 /* PlayerUnits=1: probed as before */
+        cfg_ad_player = sv;
+        printf("0.7.36: player unit pick left alone %d, poll left alone %d, PlayerUnits=1 probes %d -> %s\n", w1, w2, w3, w1 && w2 && w3 ? "OK" : "FAIL");
+        if (!(w1 && w2 && w3)) fails++;
     }
     printf("filter: %zu cases + 3 hook cases + charge, %d failed\n", sizeof c / sizeof c[0], fails);
     if (fails) bad = 1;
