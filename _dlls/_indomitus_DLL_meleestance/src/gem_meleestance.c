@@ -48,7 +48,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-#define MS_VERSION "0.7.36"
+#define MS_VERSION "0.7.37"
 #define MAXT 24
 #define TLEN 48
 
@@ -2044,9 +2044,25 @@ static uint32_t g_epoch_last;
 /* 0.7.31: every per-mission unit table is wiped when a new mission starts. Alex's Nov 9 3v3: the dedicated server crashed one
  * second after "Exit game mode" (ACCESS_VIOLATION in order_poll's nearest-enemy loop, +0x5ce3 in 0.7.30): the battle scene is
  * freed as a whole, the engine never clears our weak refs then (ref+8 stays 1), so 6 dead units were still "live" on the poll
- * list. Plain memset, no ref_free: the refs' entities and ref lists went with the old scene. */
+ * list. Plain memset, no ref_free: the refs' entities and ref lists went with the old scene.
+ * 0.7.37: not always. A player's Nov 12 conquest crash (second battle of the session, 11.6 min in, 0.7.33; game exe+0x7E6F6B,
+ * read at 8): an entity told its listed refs about an event and one of them was g_known[206].ref with every byte 0, vtable
+ * included. Only this wipe leaves a registered ref like that, so it ran after a ref had been made on an entity of the NEW
+ * mission (order events and button clicks reach known_note() without passing log_epoch(), and the tick's own log_epoch() sits
+ * behind its throttles). Every ref in use now goes through ref_free() first: one its entity still lists is unlinked, one whose
+ * entity went with the old scene is zeroed with no unlink (the 0.7.33 test). Without the list offset that test cannot be made
+ * and RefDtor on a freed entity is the 0.7.33 crash, so then the tables are only wiped, as before. */
+static uint32_t st_flush_refs;
+static void flush_ref(uint8_t *ref) { st_flush_refs++; ref_free(ref); }
 static void mission_flush(void)
 {
+    if (g_reflist_off && g_refdtor && g_tagdtor) {
+        for (int i = 0; i < NPEND; i++) if (g_pend[i].used) { flush_ref(g_pend[i].uref); flush_ref(g_pend[i].tref); }
+        for (int i = 0; i < NLAST; i++) if (g_last[i].has_ref) flush_ref(g_last[i].tref);
+        for (int i = 0; i < NDPEND; i++) if (g_dpend[i].used) flush_ref(g_dpend[i].uref);
+        for (int i = 0; i < NKNOWN; i++) if (g_known[i].used) flush_ref(g_known[i].ref);
+        for (int i = 0; i < NWANT; i++) if (g_want[i].used) { flush_ref(g_want[i].uref); flush_ref(g_want[i].tref); }
+    }
     memset(g_seen, 0, sizeof g_seen);
     memset(g_unit, 0, sizeof g_unit);
     memset(g_pend, 0, sizeof g_pend);
@@ -2064,7 +2080,7 @@ static void log_epoch(uint32_t now)
     if (g_epoch_last && now + 5000 < g_epoch_last) {
         mission_flush();
         g_lines = g_clines = g_hlines = g_vlines = g_vreflines = g_adjlines = g_adlines = g_rclines = g_dlines = g_mlines = g_mdiag = g_seenlines = g_addiag = g_plines = g_skiplines = g_olines = g_rawlines = g_polllines = g_ovtlines = g_rblines = g_reflines = 0;
-        if (cfg_log) logf_("--- clock %u -> %u: new mission, log line caps reset, unit tables cleared", g_epoch_last, now);
+        if (cfg_log) logf_("--- clock %u -> %u: new mission, log line caps reset, unit tables cleared (%u weak refs released, %u of them stale so far)", g_epoch_last, now, st_flush_refs, st_ref_stale);
     }
     g_epoch_last = now;
 }
@@ -3676,6 +3692,28 @@ int main(int argc, char **argv)
         cfg_ad_player = sv;
         printf("0.7.36: player unit pick left alone %d, poll left alone %d, PlayerUnits=1 probes %d -> %s\n", w1, w2, w3, w1 && w2 && w3 ? "OK" : "FAIL");
         if (!(w1 && w2 && w3)) fails++;
+    }
+    {   /* 0.7.37 self-test: the new-mission wipe unlinks a ref its entity still lists and drops a stale one without RefDtor's unlink */
+        static fake_t fe; memset(&fe, 0, sizeof fe);
+        static uint8_t fl[0x40]; memset(fl, 0, sizeof fl);
+        memset(g_known, 0, sizeof g_known); memset(g_pend, 0, sizeof g_pend); memset(g_last, 0, sizeof g_last);   /* earlier cases' leftovers */
+        memset(g_dpend, 0, sizeof g_dpend); memset(g_want, 0, sizeof g_want);
+        g_reflist_off = 0x198;
+        uint8_t *ra = g_known[3].ref, *rb = g_known[7].ref;
+        *(void **)ra = g_refvt; *(uint32_t *)(ra + 8) = 1; *(void **)(ra + 0x18) = fe.obj; g_known[3].used = 1;    /* listed */
+        *(void **)rb = g_refvt; *(uint32_t *)(rb + 8) = 1; *(void **)(rb + 0x18) = fe.obj; g_known[7].used = 1;    /* not listed */
+        *(void **)(fl + 0x18) = ra;
+        *(void **)(fe.obj + 0x198 + 8) = fl; *(void **)(fe.obj + 0x198 + 0x10) = fl + 0x20;
+        uint32_t n0 = st_flush_refs, s0 = st_ref_stale;
+        g_epoch_last = 0; log_epoch(900000); log_epoch(1000);
+        int z = 1; for (size_t i = 0; i < sizeof g_known; i++) if (((uint8_t *)g_known)[i]) z = 0;
+        int m1 = st_flush_refs == n0 + 2, m2 = st_ref_stale == s0 + 1;
+        g_known[3].used = 1; g_reflist_off = 0; n0 = st_flush_refs;
+        g_epoch_last = 0; log_epoch(900000); log_epoch(1000);
+        int m3 = st_flush_refs == n0 && !g_known[3].used;                                    /* offset unknown: plain wipe, as 0.7.36 */
+        g_epoch_last = 0;
+        printf("0.7.37: mission wipe released 2 refs %d, 1 stale %d, table clear %d, no list offset = plain wipe %d -> %s\n", m1, m2, z, m3, m1 && m2 && z && m3 ? "OK" : "FAIL");
+        if (!(m1 && m2 && z && m3)) fails++;
     }
     printf("filter: %zu cases + 3 hook cases + charge, %d failed\n", sizeof c / sizeof c[0], fails);
     if (fails) bad = 1;
