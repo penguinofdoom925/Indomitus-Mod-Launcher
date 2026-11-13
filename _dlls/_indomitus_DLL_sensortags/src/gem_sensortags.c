@@ -1,4 +1,4 @@
-/* GEM SensorTags 0.2 - switch a unit's sensor off with an entity tag (Call to Arms: Gates of Hell, GEM 2, 1.067)
+/* GEM SensorTags 0.3 - switch a unit's sensor off with an entity tag (Call to Arms: Gates of Hell, GEM 2, 1.067)
  *
  * While an actor (human, vehicle, gun) carries the tag "sensor_off" (ini Tag=), its sensor is off:
  * it sees nothing, spots nothing, its seen list is cleared. Remove the tag and the sensor comes back
@@ -27,6 +27,16 @@
  *   0 = every quant, as 0.1 did), always on a sensor's first quant. So a unit that spawns tagged is blind from its
  *   first tick, and a tag added or removed later acts within CheckMs. An engine write of the off byte still goes
  *   through the clear hook at once, tag test included, so a held sensor is never switched on in between.
+ * 0.3 (Alex, Nov 13 2026) [NoTarget]: an actor carrying the tag "no_target" is no target for enemies. Engine: a sensor's
+ *   seen record (eSensor exe+0x878560, record+0x18 = the seen actor) gets its "enemy I may attack" flag only when the
+ *   relation is hostile AND bit 15 of [[actor+0xDC8]+0x398] (brain flags) is set. That bit is the engine's "targetable"
+ *   state: a seat with {turnoff {targetable}} clears it on enter (exe+0x77CAE3) and sets it on exit (exe+0x77BC71), which
+ *   is how vanilla keeps the AI off crew that sit out of view; nothing else writes it. The dll clears the bit while the
+ *   tag is on and sets it again when the tag goes, for the actors it cleared itself (a table of held actors, so a crew
+ *   seat's own state is never overridden). Looked at with the sensor_off tag, in the same pass over the unit's tags, so
+ *   it acts within CheckMs and only on actors that have a sensor of their own. Why: enemies shot at drop pods that were
+ *   still being brought in; refusing the weapon pick (MeleeStance 0.7.38) did not stop it, eHumanBrain::TryAttackEnemy
+ *   builds its attack order without a weapon too.
  *
  * Build: build.bat   Offline finder + logic test: build.bat test
  */
@@ -38,7 +48,7 @@
 #include <stdarg.h>
 #include <ctype.h>
 
-#define ST_VERSION "0.2"
+#define ST_VERSION "0.3"
 #define ST_SECT    "SensorTags"
 
 typedef struct { union { char buf[16]; char *ptr; } u; size_t size, cap; } MsString;
@@ -47,6 +57,9 @@ typedef struct { union { char buf[16]; char *ptr; } u; size_t size, cap; } MsStr
 static int  cfg_enabled = 1, cfg_log = 0;
 static char cfg_tag[48] = "sensor_off";
 static size_t cfg_taglen = 10;
+static int  cfg_nt = 1;                      /* 0.3 [NoTarget] Enabled */
+static char cfg_nttag[48] = "no_target";
+static size_t cfg_nttaglen = 9;
 static uint32_t cfg_check_ms = 1000;        /* 0.2 [SensorTags] CheckMs: ms between two looks at one unit's tags; 0 = every quant */
 
 /* ---------------------------------------------------------------- log */
@@ -144,6 +157,8 @@ typedef void     (*ClearFn)(void *s);
 
 static void   **vt_sensor;
 static uint32_t o_off, o_owner, o_sensor, o_tags, s_quant;
+static uint32_t o_brain, o_bflags;          /* 0.3: actor -> brain, brain flags dword (bit 15 = targetable) */
+#define B_TARGETABLE 0x8000u
 static QuantFn  f_quant;
 static ClearFn  f_clear;
 
@@ -228,6 +243,38 @@ static const char *find_tags(void)
     return NULL;
 }
 
+/* 0.3: the targetable bit. Reader: mov r64,[r64+B] ; mov r32,[r64+F] ; shr r32,15 (the sensor's seen-record update), on
+   an F that has exactly one and dword [r+F],0xFFFF7FFF (seat enter) and one or dword [r+F],0x8000 (seat exit).
+   Not found = [NoTarget] stays off; the sensor part does not depend on it. */
+static int count_bitop(uint32_t f, int ext, uint32_t imm)          /* 81 /ext [r+f],imm32 */
+{
+    int n = 0;
+    for (uint8_t *p = g_text.p; p + 10 <= g_text.p + g_text.n; p++)
+        if (p[0] == 0x81 && (p[1] & 0xC0) == 0x80 && (p[1] & 7) != 4 && ((p[1] >> 3) & 7) == ext &&
+            *(uint32_t *)(p + 2) == f && *(uint32_t *)(p + 6) == imm) n++;
+    return n;
+}
+static const char *find_targetable(void)
+{
+    int found = 0, readers = 0;
+    o_brain = o_bflags = 0;
+    for (uint8_t *p = g_text.p; p + 16 <= g_text.p + g_text.n; p++) {
+        if ((p[0] & 0xF8) != 0x48 || p[1] != 0x8B || (p[2] & 0xC0) != 0x80 || (p[2] & 7) == 4) continue;     /* mov r64,[r64+B] */
+        if (p[7] != 0x8B || (p[8] & 0xC0) != 0x80 || (p[8] & 7) == 4) continue;                               /* mov r32,[r64+F] */
+        if (p[13] != 0xC1 || (p[14] & 0xF8) != 0xE8 || p[15] != 0x0F) continue;                               /* shr r32,15 */
+        if (((p[2] >> 3) & 7) != (p[8] & 7)) continue;                                                       /* the loaded reg is the base */
+        uint32_t b = *(uint32_t *)(p + 3), f = *(uint32_t *)(p + 9);
+        if (b < 0x400 || b > 0x4000 || (b & 7) || f < 0x100 || f > 0x1000 || (f & 3)) continue;
+        readers++;
+        if (count_bitop(f, 4, ~B_TARGETABLE) != 1 || count_bitop(f, 1, B_TARGETABLE) != 1) continue;         /* one clear, one set */
+        if (found && (o_brain != b || o_bflags != f)) return "targetable bit ambiguous";
+        o_brain = b; o_bflags = f; found = 1;
+    }
+    if (!found) { o_brain = o_bflags = 0; return readers ? "targetable writers not recognised" : "targetable reader not found"; }
+    return NULL;
+}
+static const char *g_nt_err;
+
 static const char *find_all(uint8_t *base)
 {
     o_off = o_owner = o_sensor = o_tags = s_quant = 0;
@@ -235,24 +282,29 @@ static const char *find_all(uint8_t *base)
     const char *e;
     if ((e = find_sensor())) return e;
     if ((e = find_tags())) return e;
+    g_nt_err = find_targetable();
     return NULL;
 }
 
 /* ---------------------------------------------------------------- tag test */
 static const char *ms_cstr(const MsString *s) { return s->cap > 15 ? s->u.ptr : s->u.buf; }
 
-static int has_tag(const uint8_t *e)
+/* one pass over the entity's tags: bit 0 = the sensor tag, bit 1 = the no-target tag (0.3) */
+static int tag_bits(const uint8_t *e)
 {
     const uint8_t *c = e + o_tags;
     if (*(const uint8_t *const *)(c + TC_SELF_A) != c || *(const uint8_t *const *)(c + TC_SELF_B) != c) return 0;
     const uint8_t *b = *(uint8_t *const *)(c + TC_VEC_BEG), *end = *(uint8_t *const *)(c + TC_VEC_END);
     if (!b || end < b || (size_t)(end - b) > 4096 * TAG_SIZE) return 0;
+    int r = 0;
     for (const uint8_t *t = b; t < end; t += TAG_SIZE) {
         const MsString *s = (const MsString *)(t + TAG_STR);
-        if (s->size == cfg_taglen && !memcmp(ms_cstr(s), cfg_tag, cfg_taglen)) return 1;
+        if (s->size == cfg_taglen && !memcmp(ms_cstr(s), cfg_tag, cfg_taglen)) r |= 1;
+        else if (cfg_nt && s->size == cfg_nttaglen && !memcmp(ms_cstr(s), cfg_nttag, cfg_nttaglen)) r |= 2;
     }
-    return 0;
+    return r;
 }
+static int has_tag(const uint8_t *e) { return tag_bits(e) & 1; }
 
 /* the sensor's owner, only if it really is the owner's sensor (actor+SENSOR == s) */
 static uint8_t *owner_of(uint8_t *s)
@@ -267,11 +319,66 @@ static QuantFn orig_quant;
 static ClearFn orig_clear;
 static volatile LONG g_forced;                                          /* sensors held off right now (log only) */
 
+/* 0.3 [NoTarget]: the actors whose targetable bit the dll cleared. Linear probing over NT_N slots; an address is only
+   ever compared, never read through. An actor that dies while held leaves its slot behind: it is dropped when another
+   actor turns up at that address untagged, and with the table full the slot unused for longest is taken over. */
+#define NT_N 512
+static struct { uint8_t *e; uint32_t at; } g_nt[NT_N];
+static volatile LONG g_nt_held;
+static uint32_t nt_now(void);
+static uint32_t nt_home(const uint8_t *e) { return ((uint32_t)((uintptr_t)e >> 4) * 2654435761u) >> 23; }   /* top 9 bits */
+static int nt_find(const uint8_t *e, int add)
+{
+    uint32_t h = nt_home(e), old = h, now = nt_now();
+    for (uint32_t i = 0; i < NT_N; i++) {
+        uint32_t k = (h + i) & (NT_N - 1);
+        if (g_nt[k].e == e) { g_nt[k].at = now; return (int)k; }
+        if (!g_nt[k].e) { if (!add) return -1; g_nt[k].e = (uint8_t *)e; g_nt[k].at = now; return (int)k; }
+        if ((uint32_t)(now - g_nt[k].at) > (uint32_t)(now - g_nt[old].at)) old = k;
+    }
+    if (!add) return -1;
+    g_nt[old].e = (uint8_t *)e; g_nt[old].at = now; return (int)old;
+}
+static void nt_drop(int k)                   /* linear-probe delete: later entries of the run move back over the hole */
+{
+    uint32_t i = (uint32_t)k, j = i;
+    g_nt[i].e = NULL;
+    for (uint32_t n = 0; n < NT_N; n++) {
+        j = (j + 1) & (NT_N - 1);
+        if (!g_nt[j].e) return;
+        if (((j - nt_home(g_nt[j].e)) & (NT_N - 1)) >= ((j - i) & (NT_N - 1))) { g_nt[i] = g_nt[j]; g_nt[j].e = NULL; i = j; }
+    }
+}
+static void nt_sync(uint8_t *e, int tagged)
+{
+    if (!cfg_nt || !o_bflags) return;
+    uint8_t *br = *(uint8_t **)(e + o_brain);
+    if (!br) return;
+    uint32_t *fl = (uint32_t *)(br + o_bflags);
+    if (tagged) {
+        if (!(*fl & B_TARGETABLE)) { if (g_nt_held) nt_find(e, 0); return; }     /* off already (ours, or a crew seat's) */
+        *fl &= ~B_TARGETABLE;
+        int was = nt_find(e, 0) >= 0;                                            /* held before: the engine set the bit again (seat exit) */
+        nt_find(e, 1);
+        if (!was) InterlockedIncrement(&g_nt_held);
+        if (cfg_log) logf_("no-target on:  entity %p (%ld held)", (void *)e, g_nt_held);
+    } else if (g_nt_held) {
+        int k = nt_find(e, 0);
+        if (k < 0) return;
+        nt_drop(k);
+        InterlockedDecrement(&g_nt_held);
+        if (!(*fl & B_TARGETABLE)) { *fl |= B_TARGETABLE; if (cfg_log) logf_("no-target off: entity %p (%ld held)", (void *)e, g_nt_held); }
+        else if (cfg_log) logf_("no-target: stale slot for %p dropped (%ld held)", (void *)e, g_nt_held);
+    }
+}
+
 /* off byte: 0/1 = engine value, untouched; 2/3 = held off by the tag, engine value = byte - 2 */
 static void sync(uint8_t *s, uint8_t *e)
 {
     uint8_t b = s[o_off];
-    if (has_tag(e)) {
+    int bits = tag_bits(e);
+    nt_sync(e, bits & 2);
+    if (bits & 1) {
         if (b >= 2) return;
         s[o_off] = (uint8_t)(2 + b);
         if (b == 0) orig_clear(s);                                       /* on -> off: drop the seen lists, as the engine does */
@@ -299,6 +406,7 @@ static int g_syncs;                         /* tag checks done from the quant ho
 #else
 #define st_now() ((uint32_t)GetTickCount())
 #endif
+static uint32_t nt_now(void) { return st_now(); }
 #define NCHK 4096
 static struct { uint8_t *s; uint32_t at; } g_chk[NCHK];
 static uint32_t chk_slot(const uint8_t *s) { return ((uint32_t)((uintptr_t)s >> 4) * 2654435761u) >> 20; }   /* top 12 bits */
@@ -346,6 +454,12 @@ static void load_ini(const char *ini)
     cfg_log     = GetPrivateProfileIntA(ST_SECT, "Log", 0, ini);
     int ms      = (int)GetPrivateProfileIntA(ST_SECT, "CheckMs", 1000, ini);                /* 0.2 */
     cfg_check_ms = ms < 0 ? 0 : ms > 60000 ? 60000 : (uint32_t)ms;
+    cfg_nt = GetPrivateProfileIntA("NoTarget", "Enabled", 1, ini);                              /* 0.3 */
+    GetPrivateProfileStringA("NoTarget", "Tag", cfg_nttag, buf, sizeof buf, ini);
+    {   size_t k = strlen(buf);
+        while (k && (buf[k - 1] == ' ' || buf[k - 1] == '\t')) buf[--k] = 0;
+        if (k && k < sizeof cfg_nttag) { for (size_t i = 0; i < k; i++) buf[i] = (char)tolower((unsigned char)buf[i]); strcpy(cfg_nttag, buf); }
+        cfg_nttaglen = strlen(cfg_nttag); }
     GetPrivateProfileStringA(ST_SECT, "Tag", cfg_tag, buf, sizeof buf, ini);
     size_t n = strlen(buf);
     while (n && (buf[n - 1] == ' ' || buf[n - 1] == '\t')) buf[--n] = 0;
@@ -379,6 +493,10 @@ static void install(void)
           "off +0x%X owner +0x%X actor sensor +0x%X tags +0x%X | Tag=%s Log=%d CheckMs=%u%s",
           ST_VERSION, OFF(vt_sensor), s_quant, OFF(f_quant), SLOT_CLEAR, OFF(f_clear),
           o_off, o_owner, o_sensor, o_tags, cfg_tag, cfg_log, cfg_check_ms, cfg_check_ms ? "" : " (every quant)");
+    if (!cfg_nt) logf_("  no-target: Enabled=0");
+    else if (g_nt_err) logf_("  no-target NOT active: %s", g_nt_err);
+    else logf_("  no-target ON: Tag=%s clears the targetable bit (brain +0x%X, flags +0x%X bit 15): enemy sensors do not mark the unit as attackable",
+               cfg_nttag, o_brain, o_bflags);
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res)
@@ -409,7 +527,7 @@ static int g_clears;
 static void fake_clear(void *s) { (void)s; g_clears++; }
 static uint64_t fake_quant(void *s) { (void)s; return 0; }
 
-static __attribute__((aligned(16))) uint8_t g_sensor[0x400], g_actor[0x4000], g_tag[2][TAG_SIZE];
+static __attribute__((aligned(16))) uint8_t g_sensor[0x400], g_actor[0x4000], g_tag[3][TAG_SIZE], g_brain[0x800];
 static void set_tags(int n, const char **names)
 {
     uint8_t *c = g_actor + o_tags;
@@ -435,7 +553,11 @@ int main(int argc, char **argv)
                "  off +0x%X owner +0x%X actor sensor +0x%X tags +0x%X\n",
                argv[1], OFF(vt_sensor), s_quant, OFF(f_quant), SLOT_CLEAR, OFF(f_clear), o_off, o_owner, o_sensor, o_tags);
         if (o_off != 0x18 || o_owner != 0x260 || o_sensor != 0xDD0 || s_quant != 13) { printf("  FAIL offsets differ from 1.067\n"); bad = 1; }
+        printf("  targetable: brain +0x%X flags +0x%X %s\n", o_brain, o_bflags, g_nt_err ? g_nt_err : "");
+        if (g_nt_err || o_brain != 0xDC8 || o_bflags != 0x398) { printf("  FAIL targetable bit not found as in 1.067\n"); bad = 1; }
     } else { o_off = 0x18; o_owner = 0x260; o_sensor = 0xDD0; o_tags = 0x1D0; }
+    if (!o_bflags) { o_brain = 0xDC8; o_bflags = 0x398; }
+    *(uint8_t **)(g_actor + o_brain) = g_brain; *(uint32_t *)(g_brain + o_bflags) = 0x8001;
 
     orig_clear = fake_clear; orig_quant = fake_quant;
     cfg_check_ms = 0;                                                    /* the 0.1 table below: a check on every quant */
@@ -504,6 +626,61 @@ int main(int argc, char **argv)
         cfg_check_ms = 0; g_syncs = 0; for (int i = 0; i < 5; i++) hk_quant(g_sensor);
         CK("CheckMs=0: every quant", g_syncs == 5);
         #undef CK
+    }
+    /* 0.3 [NoTarget] */
+    {
+        #define FL (*(uint32_t *)(g_brain + o_bflags))
+        #define NK(what, cond) do { int ok_ = (cond); printf("  %-60s flags %04X sensor %d held %ld %s\n", what, FL, g_sensor[o_off], g_nt_held, ok_ ? "OK" : "FAIL"); if (!ok_) bad = 1; } while (0)
+        const char *nt[] = { "soldier", "no_target" }, *both[] = { "sensor_off", "drop_pod", "no_target" }, *plain[] = { "soldier" };
+        *(uint8_t **)(g_actor + o_sensor) = g_sensor; cfg_check_ms = 0; cfg_nt = 1; g_sensor[o_off] = 0; FL = 0x8001;
+        set_tags(1, plain); hk_quant(g_sensor);
+        NK("no-target: untagged, bit untouched", FL == 0x8001 && g_nt_held == 0);
+        set_tags(2, nt); hk_quant(g_sensor);
+        NK("no-target: tag added -> bit 15 cleared, sensor still on", FL == 0x0001 && g_sensor[o_off] == 0 && g_nt_held == 1);
+        hk_quant(g_sensor); hk_quant(g_sensor);
+        NK("no-target: ticks while held", FL == 0x0001 && g_nt_held == 1);
+        FL |= 0x8000; hk_quant(g_sensor);
+        NK("no-target: engine set the bit (seat exit) -> cleared again", FL == 0x0001 && g_nt_held == 1);
+        set_tags(1, plain); hk_quant(g_sensor);
+        NK("no-target: tag removed -> bit back", FL == 0x8001 && g_nt_held == 0);
+        FL = 0x0001; hk_quant(g_sensor);
+        NK("no-target: untagged, bit off by a crew seat -> left alone", FL == 0x0001 && g_nt_held == 0);
+        set_tags(2, nt); hk_quant(g_sensor); set_tags(1, plain); hk_quant(g_sensor);
+        NK("no-target: tagged while a seat holds it off -> still off after", FL == 0x0001 && g_nt_held == 0);
+        FL = 0x8001; set_tags(3, both); hk_quant(g_sensor);
+        NK("no-target + sensor_off together (a pod being brought in)", FL == 0x0001 && g_sensor[o_off] == 2 && g_nt_held == 1);
+        set_tags(1, plain); hk_quant(g_sensor);
+        NK("both tags removed (pod landed)", FL == 0x8001 && g_sensor[o_off] == 0 && g_nt_held == 0);
+        set_tags(2, nt); hk_quant(g_sensor); FL = 0x8001; set_tags(1, plain); hk_quant(g_sensor);
+        NK("no-target: stale slot (new actor at the address) dropped", FL == 0x8001 && g_nt_held == 0);
+        cfg_nt = 0; set_tags(2, nt); hk_quant(g_sensor);
+        NK("no-target: Enabled=0 does nothing", FL == 0x8001 && g_nt_held == 0);
+        cfg_nt = 1; *(uint8_t **)(g_actor + o_brain) = NULL; hk_quant(g_sensor);
+        NK("no-target: actor without a brain ignored", FL == 0x8001 && g_nt_held == 0);
+        *(uint8_t **)(g_actor + o_brain) = g_brain; set_tags(1, plain);
+        cfg_check_ms = 1000; memset(g_chk, 0, sizeof g_chk); g_test_now = 900000; hk_quant(g_sensor);
+        set_tags(2, nt); g_test_now += 999; hk_quant(g_sensor); int e1 = FL == 0x8001;
+        g_test_now += 1; hk_quant(g_sensor);
+        NK("no-target: follows CheckMs (999 ms no, 1000 ms yes)", e1 && FL == 0x0001 && g_nt_held == 1);
+        set_tags(1, plain); g_test_now += 1000; hk_quant(g_sensor); cfg_check_ms = 0;
+        {   /* the held table on its own: 400 addresses in, every second one out, the rest still found, then all out */
+            int okc = g_nt_held == 0;
+            #define AD(i) ((uint8_t *)(uintptr_t)(0x10000 + (i) * 0x1510))
+            for (int i = 0; i < 400; i++) nt_find(AD(i), 1);
+            for (int i = 0; i < 400; i++) if (nt_find(AD(i), 0) < 0) okc = 0;
+            for (int i = 0; i < 400; i += 2) nt_drop(nt_find(AD(i), 0));
+            for (int i = 1; i < 400; i += 2) if (nt_find(AD(i), 0) < 0) okc = 0;
+            for (int i = 0; i < 400; i += 2) if (nt_find(AD(i), 0) >= 0) okc = 0;
+            for (int i = 1; i < 400; i += 2) nt_drop(nt_find(AD(i), 0));
+            int left = 0; for (int i = 0; i < NT_N; i++) if (g_nt[i].e) left++;
+            for (int i = 0; i < 700; i++) nt_find(AD(i), 1);                                    /* more than NT_N: the oldest are taken over */
+            int full = 0; for (int i = 0; i < NT_N; i++) if (g_nt[i].e) full++;
+            memset(g_nt, 0, sizeof g_nt);
+            NK("no-target: held table add / find / delete / overflow", okc && left == 0 && full == NT_N);
+            #undef AD
+        }
+        #undef NK
+        #undef FL
     }
     printf(bad ? "SOME FAILED\n" : "ALL OK\n");
     return bad;

@@ -1,4 +1,4 @@
-# GEM SensorTags 0.2
+# GEM SensorTags 0.3
 
 While a unit (human, vehicle, gun) carries the entity tag `sensor_off`, its sensor is off:
 it sees nothing, spots nothing for its side, and its seen list is dropped. This is the same state
@@ -18,11 +18,28 @@ Remove the tag and the sensor comes back in whatever state the engine wants for 
   commander sights). Crew humans have their own sensors (usually already off in closed seats).
 - Units without a `{sensor}` block are not affected.
 
+## no_target (0.3)
+While a unit carries the entity tag `no_target`, enemies do not target it: their sensors do not mark
+it as attackable, so the AI neither shoots at it nor walks up to it. Remove the tag and it is a target again.
+
+```
+{tags add "no_target"}       ; not a target
+{tags remove "no_target"}    ; a target again
+```
+
+- Read in the same pass as `sensor_off`: at once on a unit's first tick, then within `CheckMs`.
+- Engine: an enemy's seen record gets its "may attack" flag only while bit 15 of the unit's brain flags
+  (`[[actor+0xDC8]+0x398]`) is set. That bit is the SDL `targetable` state a seat with
+  `{turnoff {targetable}}` clears for its crew. The dll clears it while tagged and sets it back on untag,
+  only for units it cleared itself, so a crew seat's own state is kept.
+- ini `[NoTarget] Enabled` / `Tag`. Host only in MP, like the sensor tag. Units without their own sensor are not looked at.
+- Used by the drop pods until they land (enemies shot at pods being brought in). Works in game (Alex, Nov 13 2026).
+
 ## Files
 | File | |
 |---|---|
 | `gem_sensortags.dll` | the dll (game, editor and dedicated server) |
-| `gem_sensortags.ini` | `Enabled`, `Tag` (default `sensor_off`), `Log`, `CheckMs` (default 1000) |
+| `gem_sensortags.ini` | `Enabled`, `Tag` (default `sensor_off`), `Log`, `CheckMs` (default 1000); `[NoTarget]` `Enabled`, `Tag` (default `no_target`) |
 | `gem_sensortags.log` | written next to the dll (`_editor` / `_server` suffix for those exes) |
 
 ## Install
