@@ -1,4 +1,4 @@
-/* GEM SensorTags 0.3 - switch a unit's sensor off with an entity tag (Call to Arms: Gates of Hell, GEM 2, 1.067)
+/* GEM SensorTags 0.4 - switch a unit's sensor off with an entity tag (Call to Arms: Gates of Hell, GEM 2, 1.067)
  *
  * While an actor (human, vehicle, gun) carries the tag "sensor_off" (ini Tag=), its sensor is off:
  * it sees nothing, spots nothing, its seen list is cleared. Remove the tag and the sensor comes back
@@ -37,6 +37,16 @@
  *   it acts within CheckMs and only on actors that have a sensor of their own. Why: enemies shot at drop pods that were
  *   still being brought in; refusing the weapon pick (MeleeStance 0.7.38) did not stop it, eHumanBrain::TryAttackEnemy
  *   builds its attack order without a weapon too.
+ * 0.4 (Alex, Nov 15 2026) [Visors]: a unit held off by the tag also stops DRAWING its sight cones. The cones follow each
+ *   visor's own IsActive (game exe+0x890660), which never looks at the sensor's off byte: a visor no crew seat points at
+ *   is active whenever it has a vision and a bone, so a waiting Deathstorm pod showed all five turret cones. IsActive
+ *   answers "no" when seats reference the visor (word +0x62 != 0) and none of them is occupied (word +0x60 == 0). While
+ *   the owner is tagged the dll sets bit 15 of the +0x62 word on every visor of the sensor (vector of visor pointers at
+ *   sensor+0x2D8 / +0x2E0) and clears it again when the tag goes. The engine only ever inc/decs that word and tests it
+ *   against 0, so the low bits keep counting; a visor whose seat is occupied stays active (crewed units are not hidden).
+ *   The mark lives in the visor itself: nothing to remember, nothing stale when a unit dies while held.
+ *   Clients: eSensorClient (same layout, a no-op quant in the same slot) gets the visor part only, so the cones also go
+ *   on a machine that is not the host. Entity tags set by script exist there too.
  *
  * Build: build.bat   Offline finder + logic test: build.bat test
  */
@@ -48,7 +58,7 @@
 #include <stdarg.h>
 #include <ctype.h>
 
-#define ST_VERSION "0.3"
+#define ST_VERSION "0.4"
 #define ST_SECT    "SensorTags"
 
 typedef struct { union { char buf[16]; char *ptr; } u; size_t size, cap; } MsString;
@@ -61,6 +71,7 @@ static int  cfg_nt = 1;                      /* 0.3 [NoTarget] Enabled */
 static char cfg_nttag[48] = "no_target";
 static size_t cfg_nttaglen = 9;
 static uint32_t cfg_check_ms = 1000;        /* 0.2 [SensorTags] CheckMs: ms between two looks at one unit's tags; 0 = every quant */
+static int  cfg_vis = 1;                     /* 0.4 [Visors] Enabled */
 
 /* ---------------------------------------------------------------- log */
 static char  g_logpath[MAX_PATH];
@@ -275,6 +286,44 @@ static const char *find_targetable(void)
 }
 static const char *g_nt_err;
 
+/* 0.4: visors. IsActive holds  cmp word [rbx+REF],0 ; je ; cmp word [rbx+OCC],0  with REF = OCC + 2 (one place in the
+   exe). The visor vector: mov r64,[r64+V] ; mov r64,[r64+V+8] followed within 0x30 bytes by a call into that function.
+   Not found = [Visors] stays off; the rest does not depend on it. */
+static uint32_t o_vref, o_vvec;
+static void   **vt_client;                  /* eSensorClient (none in the editor) */
+#define V_HELD 0x8000u
+static const char *find_visors(void)
+{
+    uint8_t *sig = NULL; int hits = 0;
+    o_vref = o_vvec = 0;
+    for (uint8_t *p = g_text.p; p + 12 <= g_text.p + g_text.n; p++) {
+        if (p[0] != 0x66 || p[1] != 0x83 || p[2] != 0x7B || p[4] != 0x00 || p[5] != 0x74) continue;
+        if (p[7] != 0x66 || p[8] != 0x83 || p[9] != 0x7B || p[11] != 0x00) continue;
+        if (p[3] != p[10] + 2 || p[10] < 0x20 || p[10] > 0x78) continue;
+        sig = p; hits++;
+    }
+    if (hits != 1) return hits ? "visor IsActive ambiguous" : "visor IsActive not found";
+    uint32_t ref = sig[3], vec = 0; int n = 0;
+    for (uint8_t *p = g_text.p; p + 14 + 0x30 + 5 <= g_text.p + g_text.n; p++) {
+        if ((p[0] & 0xFA) != 0x48 || p[1] != 0x8B || (p[2] & 0xC0) != 0x80 || (p[2] & 7) == 4) continue;      /* mov r64,[r64+V] */
+        if ((p[7] & 0xFA) != 0x48 || p[8] != 0x8B || (p[9] & 0xC0) != 0x80 || (p[9] & 7) == 4) continue;      /* mov r64,[r64+V+8] */
+        uint32_t v = *(uint32_t *)(p + 3);
+        if (v < 0x100 || v > 0x800 || (v & 7) || *(uint32_t *)(p + 10) != v + 8) continue;
+        for (uint8_t *q = p + 14; q < p + 14 + 0x30; q++) {
+            if (q[0] != 0xE8) continue;
+            uint8_t *t = rel32(q, 5);
+            if (t > sig || sig - t > 0x80) continue;
+            if (vec && vec != v) return "visor vector offset ambiguous";
+            vec = v; n++; break;
+        }
+    }
+    if (!n) return "visor vector offset not found";
+    o_vref = ref; o_vvec = vec;
+    vt_client = find_vtable(".?AVeSensorClient@Actor@@");
+    return NULL;
+}
+static const char *g_vis_err;
+
 static const char *find_all(uint8_t *base)
 {
     o_off = o_owner = o_sensor = o_tags = s_quant = 0;
@@ -283,6 +332,7 @@ static const char *find_all(uint8_t *base)
     if ((e = find_sensor())) return e;
     if ((e = find_tags())) return e;
     g_nt_err = find_targetable();
+    g_vis_err = find_visors();
     return NULL;
 }
 
@@ -372,12 +422,32 @@ static void nt_sync(uint8_t *e, int tagged)
     }
 }
 
+/* 0.4 [Visors]: mark / unmark every visor of the sensor. Returns how many words changed. */
+static volatile LONG g_vis_marked;
+static int vis_sync(uint8_t *s, int tagged)
+{
+    if (!cfg_vis || !o_vvec) return 0;
+    uint8_t **b = *(uint8_t ***)(s + o_vvec), **e = *(uint8_t ***)(s + o_vvec + 8);
+    if (!b || e < b || (size_t)(e - b) > 64) return 0;
+    int n = 0;
+    for (; b < e; b++) {
+        uint8_t *v = *b;
+        if (!v) continue;
+        uint16_t *w = (uint16_t *)(v + o_vref);
+        if (tagged) { if (!(*w & V_HELD)) { *w |= V_HELD; n++; InterlockedIncrement(&g_vis_marked); } }
+        else if (*w & V_HELD) { *w &= (uint16_t)~V_HELD; n++; InterlockedDecrement(&g_vis_marked); }
+    }
+    return n;
+}
+
 /* off byte: 0/1 = engine value, untouched; 2/3 = held off by the tag, engine value = byte - 2 */
 static void sync(uint8_t *s, uint8_t *e)
 {
     uint8_t b = s[o_off];
     int bits = tag_bits(e);
     nt_sync(e, bits & 2);
+    {   int vn = vis_sync(s, bits & 1);
+        if (vn && cfg_log) logf_("visors: entity %p sensor %p, %d visor(s) %s (%ld marked)", (void *)e, (void *)s, vn, (bits & 1) ? "hidden" : "shown", g_vis_marked); }
     if (bits & 1) {
         if (b >= 2) return;
         s[o_off] = (uint8_t)(2 + b);
@@ -431,6 +501,20 @@ static uint64_t hk_quant(void *sv)
     return orig_quant(sv);
 }
 
+/* 0.4: a client-side sensor (eSensorClient). Its own quant does nothing; only the visor marks are kept in step with the tag. */
+static QuantFn orig_cquant;
+static int g_client_seen;
+static uint64_t hk_cquant(void *sv)
+{
+    uint8_t *s = sv, *e = owner_of(s);
+    if (e && check_due(s)) {
+        if (!g_client_seen) { g_client_seen = 1; logf_("  visors: client sensors are ticking (first one: entity %p)", (void *)e); }
+        int vn = vis_sync(s, has_tag(e));
+        if (vn && cfg_log) logf_("visors (client): entity %p sensor %p, %d visor(s) changed (%ld marked)", (void *)e, (void *)s, vn, g_vis_marked);
+    }
+    return orig_cquant(sv);
+}
+
 /* the engine wrote 0/1 into a held sensor (it always does: 2/3 never equals its value) and calls
    clear: keep that value and hold the sensor off again */
 static void hk_clear(void *sv)
@@ -455,6 +539,7 @@ static void load_ini(const char *ini)
     int ms      = (int)GetPrivateProfileIntA(ST_SECT, "CheckMs", 1000, ini);                /* 0.2 */
     cfg_check_ms = ms < 0 ? 0 : ms > 60000 ? 60000 : (uint32_t)ms;
     cfg_nt = GetPrivateProfileIntA("NoTarget", "Enabled", 1, ini);                              /* 0.3 */
+    cfg_vis = GetPrivateProfileIntA("Visors", "Enabled", 1, ini);                               /* 0.4 */
     GetPrivateProfileStringA("NoTarget", "Tag", cfg_nttag, buf, sizeof buf, ini);
     {   size_t k = strlen(buf);
         while (k && (buf[k - 1] == ' ' || buf[k - 1] == '\t')) buf[--k] = 0;
@@ -497,6 +582,17 @@ static void install(void)
     else if (g_nt_err) logf_("  no-target NOT active: %s", g_nt_err);
     else logf_("  no-target ON: Tag=%s clears the targetable bit (brain +0x%X, flags +0x%X bit 15): enemy sensors do not mark the unit as attackable",
                cfg_nttag, o_brain, o_bflags);
+    if (!cfg_vis) logf_("  visors: Enabled=0");
+    else if (g_vis_err) logf_("  visors NOT active: %s", g_vis_err);
+    else {
+        int cl = 0;
+        if (vt_client && in_text(vt_client[s_quant]) && vt_client[s_quant] != (void *)f_quant) {
+            orig_cquant = (QuantFn)vt_client[s_quant];
+            cl = patch_slot(&vt_client[s_quant], (void *)hk_cquant);
+        }
+        logf_("  visors ON: a held unit's visors are marked inactive (visor +0x%X bit 15, vector at sensor +0x%X): no sight cones | client sensors %s",
+              o_vref, o_vvec, cl ? "hooked too" : vt_client ? "NOT hooked" : "none in this exe");
+    }
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID res)
@@ -555,6 +651,8 @@ int main(int argc, char **argv)
         if (o_off != 0x18 || o_owner != 0x260 || o_sensor != 0xDD0 || s_quant != 13) { printf("  FAIL offsets differ from 1.067\n"); bad = 1; }
         printf("  targetable: brain +0x%X flags +0x%X %s\n", o_brain, o_bflags, g_nt_err ? g_nt_err : "");
         if (g_nt_err || o_brain != 0xDC8 || o_bflags != 0x398) { printf("  FAIL targetable bit not found as in 1.067\n"); bad = 1; }
+        printf("  visors: ref +0x%X vector +0x%X client vtable %s %s\n", o_vref, o_vvec, vt_client ? "found" : "none", g_vis_err ? g_vis_err : "");
+        if (g_vis_err || o_vref != 0x62 || o_vvec != 0x2D8) { printf("  FAIL visor offsets not found as in 1.067\n"); bad = 1; }
     } else { o_off = 0x18; o_owner = 0x260; o_sensor = 0xDD0; o_tags = 0x1D0; }
     if (!o_bflags) { o_brain = 0xDC8; o_bflags = 0x398; }
     *(uint8_t **)(g_actor + o_brain) = g_brain; *(uint32_t *)(g_brain + o_bflags) = 0x8001;
@@ -681,6 +779,42 @@ int main(int argc, char **argv)
         }
         #undef NK
         #undef FL
+    }
+    /* 0.4 [Visors] */
+    {
+        #define VK(what, cond) do { int ok_ = (cond); printf("  %-62s refs %04X %04X %04X marked %ld %s\n", what, R(0), R(1), R(2), g_vis_marked, ok_ ? "OK" : "FAIL"); if (!ok_) bad = 1; } while (0)
+        static uint8_t vis[3][0x100]; static uint8_t *vec[3] = { vis[0], vis[1], vis[2] };
+        #define R(i) (*(uint16_t *)(vis[i] + o_vref))
+        #define OCC(i) (*(uint16_t *)(vis[i] + o_vref - 2))
+        if (!o_vvec) { o_vref = 0x62; o_vvec = 0x2D8; }
+        const char *held[] = { "drop_pod", "sensor_off" }, *plain[] = { "drop_pod" };
+        memset(vis, 0, sizeof vis); R(1) = 1; OCC(1) = 0; R(2) = 2; OCC(2) = 1;       /* 0: no seat, 1: empty seat, 2: occupied seat */
+        *(uint8_t ***)(g_sensor + o_vvec) = vec; *(uint8_t ***)(g_sensor + o_vvec + 8) = vec + 3;
+        *(uint8_t **)(g_actor + o_sensor) = g_sensor; *(uint8_t **)(g_actor + o_brain) = g_brain;
+        cfg_check_ms = 0; cfg_vis = 1; g_sensor[o_off] = 0; g_vis_marked = 0;
+        set_tags(1, plain); hk_quant(g_sensor);
+        VK("visors: untagged, untouched", R(0) == 0 && R(1) == 1 && R(2) == 2 && g_vis_marked == 0);
+        set_tags(2, held); hk_quant(g_sensor);
+        VK("visors: tag added -> bit 15 on all three", R(0) == 0x8000 && R(1) == 0x8001 && R(2) == 0x8002 && g_vis_marked == 3);
+        hk_quant(g_sensor); R(2)++; R(1)--;                                             /* the engine's own inc / dec while held */
+        hk_quant(g_sensor);
+        VK("visors: engine inc / dec while held keep counting", R(0) == 0x8000 && R(1) == 0x8000 && R(2) == 0x8003 && g_vis_marked == 3);
+        set_tags(1, plain); hk_quant(g_sensor);
+        VK("visors: tag removed -> counts back, no bit", R(0) == 0 && R(1) == 0 && R(2) == 3 && g_vis_marked == 0);
+        cfg_vis = 0; set_tags(2, held); hk_quant(g_sensor);
+        VK("visors: Enabled=0 does nothing (sensor still held)", R(0) == 0 && g_sensor[o_off] == 2 && g_vis_marked == 0);
+        cfg_vis = 1; set_tags(1, plain); hk_quant(g_sensor);
+        *(uint8_t ***)(g_sensor + o_vvec + 8) = vec + 3000; set_tags(2, held); hk_quant(g_sensor);
+        VK("visors: an implausible vector is left alone", R(0) == 0 && g_vis_marked == 0);
+        *(uint8_t ***)(g_sensor + o_vvec + 8) = vec + 3; set_tags(1, plain); hk_quant(g_sensor);
+        orig_cquant = fake_quant; g_sensor[o_off] = 0; set_tags(2, held); hk_cquant(g_sensor);
+        VK("visors: client sensor, tag -> marked, off byte untouched", R(0) == 0x8000 && g_sensor[o_off] == 0 && g_vis_marked == 3);
+        set_tags(1, plain); hk_cquant(g_sensor);
+        VK("visors: client sensor, tag gone -> shown", R(0) == 0 && R(2) == 3 && g_vis_marked == 0);
+        *(uint8_t ***)(g_sensor + o_vvec) = NULL; *(uint8_t ***)(g_sensor + o_vvec + 8) = NULL;
+        #undef VK
+        #undef R
+        #undef OCC
     }
     printf(bad ? "SOME FAILED\n" : "ALL OK\n");
     return bad;

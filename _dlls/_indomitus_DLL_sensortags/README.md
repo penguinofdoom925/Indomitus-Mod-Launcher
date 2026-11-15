@@ -1,4 +1,6 @@
-# GEM SensorTags 0.3
+# GEM SensorTags 0.4
+
+0.4 (Nov 15 2026): `[Visors] Enabled=1` - a unit held off by the tag also stops drawing its sight cones (bit 15 of each visor's seat-reference word, so the visor reads as inactive), on the host and on clients (`eSensorClient` quant slot hooked for the visor part only). A visor whose crew seat is occupied is not hidden.
 
 While a unit (human, vehicle, gun) carries the entity tag `sensor_off`, its sensor is off:
 it sees nothing, spots nothing for its side, and its seen list is dropped. This is the same state
