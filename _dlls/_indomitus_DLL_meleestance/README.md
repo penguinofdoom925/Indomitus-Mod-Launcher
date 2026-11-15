@@ -1,4 +1,4 @@
-# GEM MeleeStance 0.7.37
+# GEM MeleeStance 0.7.41
 
 ## 0.7.31 - 0.7.35 (Nov 9-11 2026, short form; full notes in the comments of src\gem_meleestance.c and in the ini)
 - 0.7.31: all unit tables are cleared when the sim clock goes backwards (new mission). A finished mission's units stayed on the
@@ -19,6 +19,19 @@
   `hb:` line: new `fast pass N` and `gated N` counters. Self-test: `0.7.35:` line (11 cases).
 - 0.7.36: `[AutoDraw] PlayerUnits=0` is the default and covers every fight-range path (scan, order picks, order poll): a
   human player's units are never swapped by the dll; the melee toggle is their switch. Bots keep the automatic swap.
+- 0.7.41 (Nov 15 2026): `PlayerMaxDistance` 1000 (50 m, Alex); an enemy whose entity is not where the unit's sensor
+  record has it (gap over 15 m and over half the recorded distance) is not charged: stale records of parked / inactive
+  entities sent stance units to the map corner. Log `charge: ... is recorded at X but the entity is at Y`.
+- 0.7.40 (Nov 15 2026, from the 0.7.39 log of Alex's second 3v3): a stance unit charges the enemy the player ordered it
+  onto (the charge is redirected from the scan's pick: draw, run, melee order; no distance limit; kept while that enemy
+  lives or until another order), because an attack order alone does not move a stance unit; `[Charge] PlayerMaxDistance`
+  600: a player's unit charges an enemy of its own choosing only inside 30 m (it ran at enemies 40-90 m off);
+  IgnoreTargetTags targets are never charged.
+- 0.7.39 (Nov 15 2026, first 3v3 online test, 255 units listed): a player's attack order on an enemy stands at every range
+  (beyond fight range the charge used to replace it with the scan's pick) and the unit stays on that enemy while it lives;
+  "infantry first" only refuses a vehicle while the unit has a charge on infantry (stance units stood idle with no usable
+  weapon); tables: charge memory 256 -> 1024, own-order ring 64 -> 256, pending queue 64 -> 256; a human player's units
+  get 400 extra `charge:` log lines per mission. Self-test: `0.7.39:` line. (0.7.38 was the dropped `[NoTarget]` build.)
 - 0.7.37: the new-mission wipe releases every weak ref through `ref_free()` before clearing the tables. A player's Nov 12
   conquest game (0.7.33) crashed in its second battle at game exe+0x7E6F6B: an entity notified a listed ref that the wipe had
   zeroed (`g_known[206]`, vtable 0). Self-test: `0.7.37:` line.

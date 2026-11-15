@@ -48,7 +48,7 @@
 #include <stdarg.h>
 #include <math.h>
 
-#define MS_VERSION "0.7.37"
+#define MS_VERSION "0.7.41"
 #define MAXT 24
 #define TLEN 48
 
@@ -65,6 +65,7 @@ static uint32_t cfg_refresh_ms = 400;    /* 0.7.9 [Charge] RefreshMs: a running 
                                           * attack / melee order) this soon after the last order; RetargetMs still gates every other re-order (Alex: "the move
                                           * order cycle is a bit slow, they don't react to changes in the enemy position very quickly" - both sat behind 1500) */
 static float cfg_charge_max = 2000.0f;    /* world units (20 = 1 m), 0 = any enemy the scan sees */
+static float cfg_charge_pmax = 1000.0f;   /* 0.7.40 [Charge] PlayerMaxDistance: a human player's unit charges an enemy of its own choosing only inside this (0.7.41: 50 m, Alex) */
 static float cfg_charge_min = 60.0f;      /* world units: closer than this = already fighting, no new order */
 static int   cfg_down_on = 1;             /* [Downed]: no weapon is chosen against a target carrying the downed tag */
 static char  cfg_downtag[1][TLEN] = { "start_personage" };   /* 40k_human.inc start_personage / stop_personage */
@@ -500,7 +501,7 @@ static int in_manual(const uint8_t *ent)
  * not use this queue (eOutdoorsBattle keeps its own), so an eAttack / eAttackBasic / eFight at the front that the dll did
  * not add came from the player (or a script command). Target ref at order+0x40: type +0x48 (1 = entity), entity +0x58. */
 static void **g_vt_attack, **g_vt_attackb, **g_vt_fight;
-#define NMINE 64
+#define NMINE 256                           /* 0.7.39: was 64; 250 charging units pushed live orders out of the ring */
 static void *g_mine[NMINE];                 /* orders the dll added (charge), newest overwrite oldest */
 static int g_mine_i, g_vlines;
 static void mine_add(void *o) { if (o) { g_mine[g_mine_i] = o; g_mine_i = (g_mine_i + 1) % NMINE; } }
@@ -585,6 +586,19 @@ static int front_is_mine(const uint8_t *ent)
     return 0;
 }
 
+/* 0.7.39 */
+#define PLINES 400                          /* extra log lines per mission for a human player's units */
+static int g_pclines, g_xlines, g_vfreelines;
+static uint32_t st_explicit, st_veh_free, st_redirect, st_ghost;
+static int g_ghostlines;
+static int cfg_ghost = 1;                   /* 0.7.41: the recorded-vs-real position test in charge_note (the self-test's fakes have no entity position) */
+static int player_owned(const uint8_t *ent)
+{
+    const uint8_t *br = ent ? *(const uint8_t *const *)(ent + 0xDC8) : NULL;
+    return br && (br[0x398] & 3) == 1;
+}
+static int charging_infantry(const uint8_t *ent);   /* defined after the charge tables */
+
 /* what to do with this candidate: PASS (vanilla), REJECT (not melee, unit in stance), MELEE (melee ammo, unit in stance) */
 static int ms_decide(const uint8_t *ctx)
 {
@@ -620,6 +634,15 @@ static int ms_decide(const uint8_t *ctx)
             if (!ts) { st_veh_reject++; return REJECT; }                        /* only stance units melee vehicles */
             if (order_target(ent, 1) == tg) return MELEE;                       /* 0.7.1: already charging it (dll order): infantry-first no longer pulls the weapon (units stood beside tanks) */
             unit_t *s = unit_of(ent, 0);
+            /* 0.7.39 (Alex, Nov 15 2026 3v3: stance Sternguard stood doing nothing; server log: melee vs a vehicle refused every
+             * tick, "enemy infantry within 400 seen 65 ms ago"): infantry first only holds while the unit HAS a charge on
+             * infantry. With none (the scan keeps choosing the vehicle; the infantry it glimpsed is never offered as a melee
+             * target) the refusal left it with no weapon at all - guns are refused by the stance. Now it takes the vehicle. */
+            if (s && s->inf_ms && (uint32_t)(now_ms() - s->inf_ms) < cfg_inf_ms && !charging_infantry(ent)) {
+                st_veh_free++;
+                if (cfg_log && g_vfreelines < 40) { g_vfreelines++; logf_("vehicles: [%u ms] unit %p enemy infantry seen %u ms ago but no charge on it: melee vs vehicle %p allowed (%u)", now_ms(), (void *)ent, now_ms() - s->inf_ms, (void *)tg, st_veh_free); }
+                return MELEE;
+            }
             if (s && s->inf_ms && (uint32_t)(now_ms() - s->inf_ms) < cfg_inf_ms) {                                    /* infantry first */
                 st_veh_pref++;
                 if (cfg_log && g_vreflines < 20) { g_vreflines++; logf_("vehicles: [%u ms] unit %p melee vs vehicle %p refused: enemy infantry within %.0f seen %u ms ago (refusals %u)", now_ms(), (void *)ent, (void *)tg, cfg_inf_range, now_ms() - s->inf_ms, st_veh_pref); }
@@ -666,9 +689,10 @@ typedef struct {
     float dist;
     uint32_t clock;
     int ff;                 /* 0.7.24: fight order even when the melee weapon is not in hand */
+    int pl;                 /* 0.7.39: the target is the player's own attack-order target */
     int used, veh, stalled; /* veh: target is a vehicle (0.7); stalled: re-order after a stall (0.7.8: vs a vehicle = attack order, no second run) */
 } pend_t;
-#define NPEND 64
+#define NPEND 256                           /* 0.7.39: was 64 (a full queue drops the charge silently) */
 static pend_t g_pend[NPEND];
 
 /* per unit: last charge order (ms, target as a weak ref, distance when ordered / last seen closing) and last take-item order */
@@ -678,6 +702,7 @@ typedef struct {
     float ux, uy; int stalls;                /* 0.7.1: the unit's own position at the last stall sample, stalled samples in a row */
     uint32_t vchk_ms, adj_until; float vux, vuy; const void *adj_tgt;   /* 0.7.3: hull-contact sample vs a vehicle, and the "pressed against it" window */
     const void *otgt; int ogo;               /* 0.7.17: last logged order-path pick (enemy, decision + 1) */
+    int pl;                                  /* 0.7.39: this target is the one the player ordered: no switch to another enemy while it lives */
     __attribute__((aligned(16))) uint8_t tref[REFSZ];
 } last_t;
 static float cfg_close = 150.0f;         /* [Charge] CloseDistance: inside it the attack order, outside a move order to the enemy */
@@ -695,7 +720,8 @@ static int goal_moved(float d, float mx, float my)
 #define PROGRESS_SAMPLE_MS 1000          /* the stall test samples a second apart, not tick to tick */
 #define CLINES 200                       /* charge log lines per session (0.7.8: was 40, Alex runs several sims per editor session) */
 #define STALL_SAMPLES 2                  /* 0.7.1: stalled samples in a row before the order is re-issued */
-#define NLAST 256
+#define NLAST 1024                          /* 0.7.39: was 256; Alex's Nov 15 3v3 kept 255 units listed, slots were evicted and their
+                                             * units re-ordered on every scan (the run restarts each time: units stood still) */
 static last_t g_last[NLAST];
 static float cfg_switch = 0.6f;          /* [Charge] SwitchRatio: another enemy only when closer than this x the current target's distance */
 static float cfg_progress = 10.0f;       /* world units the unit must have closed on its target between checks to count as still charging */
@@ -767,7 +793,7 @@ static void last_reset(last_t *l, const void *unit)
 {
     if (l->has_ref) ref_free(l->tref);
     l->unit = unit; l->tgt = NULL; l->ms = 0; l->draw_ms = 0; l->chk_ms = 0; l->lastd = 0; l->has_ref = 0; l->held = 0;
-    l->phase = 0; l->ox = l->oy = 0; l->ux = l->uy = 0; l->stalls = 0;
+    l->phase = 0; l->ox = l->oy = 0; l->ux = l->uy = 0; l->stalls = 0; l->pl = 0;
     l->otgt = NULL; l->ogo = 0;                                                     /* 0.7.17 */
     l->vchk_ms = 0; l->adj_until = 0; l->vux = l->vuy = 0; l->adj_tgt = NULL;
 }
@@ -790,6 +816,19 @@ static void last_order(last_t *l, const void *tgt, float d, uint32_t now)
     ref_make(l->tref, (void *)tgt); l->has_ref = 1;
     l->tgt = tgt; l->lastd = d; l->ms = now; l->chk_ms = now; l->stalls = 0;
     if (l->unit) { l->ux = *(const float *)((const uint8_t *)l->unit + 0x74); l->uy = *(const float *)((const uint8_t *)l->unit + 0x78); }
+}
+/* 0.7.39: the unit is on enemy infantry right now: an attack / melee order on a human at the front (the dll's or the
+ * player's), or the dll's run at a human is still its front order or was given within CHARGE_INF_MS */
+#define CHARGE_INF_MS 3000
+static int charging_infantry(const uint8_t *ent)
+{
+    const uint8_t *ct = order_target(ent, 1);
+    if (ct && !is_vehicle(ct)) return 1;
+    last_t *l = last_of(ent, 0);
+    if (!l || !l->ms || !l->has_ref) return 0;
+    const uint8_t *cur = (const uint8_t *)ref_ent(l->tref);
+    if (!cur || is_vehicle(cur)) return 0;
+    return front_is_mine(ent) || (uint32_t)(now_ms() - l->ms) < CHARGE_INF_MS;
 }
 static float dist3(const uint8_t *a, const uint8_t *b)
 {
@@ -857,12 +896,15 @@ static void charge_flush(const uint8_t *scanning)
             last_t *l = last_of(p->unit, 1);
             last_order(l, p->tgt, p->dist, now);
             l->phase = phase;
+            l->pl = p->pl;
             l->ox = xy[0]; l->oy = xy[1];
             if (ok) st_charge_go++; else st_charge_drop++;
-            if (cfg_log && g_clines < CLINES) {
-                g_clines++;
+            int plog = player_owned(p->unit) && g_pclines < PLINES;    /* 0.7.39: a human player's units keep their own line budget */
+            if (cfg_log && (g_clines < CLINES || plog)) {
+                if (g_clines < CLINES) g_clines++; else g_pclines++;
                 logf_("charge: [%u ms] unit %p -> enemy %p at %.0f %s %s (orders %u, refused %u)", now, (void *)p->unit, (void *)p->tgt,
                       p->dist, kind, ok ? "ordered" : "REFUSED by AddOrder", st_charge_go, st_charge_drop);
+                if (plog) logf_("  ^ player unit%s", p->pl ? ", on the enemy the player ordered" : "");
             }
         } else st_charge_drop++;
         ref_free(p->uref); ref_free(p->tref);
@@ -871,6 +913,7 @@ static void charge_flush(const uint8_t *scanning)
 }
 
 static int g_pend_ff;
+static int g_pend_pl;                       /* 0.7.39: the next pend_push is for the player's ordered target */
 /* queue a charge / fight order for a later tick (0.7.18: shared by charge_note and the order poll) */
 static void pend_push(uint8_t *ent, uint8_t *tgt, float d, int veh, int stalled, uint32_t now)
 {
@@ -881,14 +924,14 @@ static void pend_push(uint8_t *ent, uint8_t *tgt, float d, int veh, int stalled,
             if (veh && !p->veh) return;                       /* infantry already queued: it wins */
             if (veh == p->veh && d >= p->dist) return;        /* already queued a nearer enemy */
             ref_free(p->tref); ref_make(p->tref, tgt);
-            p->tgt = tgt; p->dist = d; p->clock = now; p->veh = veh; p->stalled = stalled; p->ff = g_pend_ff;
+            p->tgt = tgt; p->dist = d; p->clock = now; p->veh = veh; p->stalled = stalled; p->ff = g_pend_ff; p->pl = g_pend_pl;
             return;
         }
         if (!p->used && !free_) free_ = p;
     }
     if (!free_) return;
     ref_make(free_->uref, ent); ref_make(free_->tref, tgt);
-    free_->unit = ent; free_->tgt = tgt; free_->dist = d; free_->clock = now; free_->used = 1; free_->veh = veh; free_->stalled = stalled; free_->ff = g_pend_ff;
+    free_->unit = ent; free_->tgt = tgt; free_->dist = d; free_->clock = now; free_->used = 1; free_->veh = veh; free_->stalled = stalled; free_->ff = g_pend_ff; free_->pl = g_pend_pl;
     st_charge_q++;
 }
 
@@ -907,6 +950,7 @@ static void charge_note(const uint8_t *ctx, int inhand, int stance)
     int veh = is_vehicle(tgt), ts = tag_stance(ent), stalled = 0;
     if (veh && !(cfg_veh_on && ts)) return;                  /* vehicles: stance units only (ms_decide already applied infantry-first) */
     if (cfg_down_on && vec_has(tgt + cfg_enttags, cfg_downtag, 1) == 1) return;   /* downed */
+    if (ignored_target(tgt)) return;                           /* 0.7.40: IgnoreTargetTags (waiting call-ins, hidden units) are never charged */
     if (!stance && vec_has(ent + cfg_enttags, g_ctagl, 1) != 1) return;
     if (!stance && cfg_charge_inhand && !inhand) return;
     if (!cfg_charge_player) {
@@ -918,6 +962,44 @@ static void charge_note(const uint8_t *ctx, int inhand, int stance)
     float dy = *(const float *)(ent + 0x78) - *(const float *)(ti + 0x2C);
     float dz = *(const float *)(ent + 0x7C) - *(const float *)(ti + 0x30);
     float d = sqrtf(dx * dx + dy * dy + dz * dz);
+    /* 0.7.41 (Alex: the corner move orders "were clearly broken / null"): the distance above is to where the unit's sensor
+     * record says the enemy is (target info +0x28); the orders (run goal, eFight) go to the ENTITY, whose own position can be
+     * somewhere else entirely - MP parks inactive entities (the server log has "inactive" humans), and a stale record of one
+     * sent the unit across the map while it read as an enemy 5 m away. A target whose real position is not where the record
+     * has it is not charged. */
+    {
+        float de = dist3(ent, tgt), gap = de > d ? de - d : d - de;
+        if (cfg_ghost && gap > 300.0f && gap > 0.5f * d) {
+            st_ghost++;
+            if (cfg_log && g_ghostlines < 60) { g_ghostlines++; logf_("charge: [%u ms] unit %p: enemy %p is recorded at %.0f but the entity is at %.0f (%.0f %.0f): not charged (ghosts %u)", *g_clock, (void *)ent, (void *)tgt, d, de, *(const float *)(tgt + 0x74), *(const float *)(tgt + 0x78), st_ghost); }
+            return;
+        }
+    }
+    /* 0.7.40 (Alex, Nov 15 2026 on 0.7.39: "my guys in melee stance ignore my orders to attack people when I right click
+     * them"): 0.7.39 only kept his attack order, and an attack order alone does not move a stance unit (guns refused, the
+     * sword out of reach: it stands). Now the charge itself goes to the enemy he ordered - draw, run, melee order - whatever
+     * the scan picked, at any distance, and stays on it while it lives (last_t.pl) or until he gives another order. */
+    int ptgt = 0;
+    {
+        const uint8_t *pt = explicit_target(ent);
+        last_t *lp = last_of(ent, 0);
+        if (!pt && lp && lp->pl) {
+            if (front_order(ent) && !front_is_mine(ent)) lp->pl = 0;          /* another order of his since (move, stop ...) */
+            else if (lp->has_ref) pt = (const uint8_t *)ref_ent(lp->tref);
+        }
+        if (pt && pt != ent && (pt[0x30] & 0x02) && pt[0xDA8] != ent[0xDA8] && !((pt[0x30] & 0x04) && linked_raw(pt))
+            && !(cfg_down_on && vec_has(pt + cfg_enttags, cfg_downtag, 1) == 1)) {
+            int pveh = is_vehicle(pt);
+            if (!pveh || (cfg_veh_on && ts)) {
+                if (pt != tgt) {
+                    st_redirect++;
+                    if (cfg_log && g_xlines < 80) { g_xlines++; logf_("charge: [%u ms] unit %p: the scan chose %p, the player ordered %p: charging that one, at %.0f (redirects %u)", *g_clock, (void *)ent, (void *)tgt, (const void *)pt, dist3(ent, pt), st_redirect); }
+                    tgt = (uint8_t *)(uintptr_t)pt; veh = pveh; d = dist3(ent, tgt);
+                }
+                ptgt = 1;
+            }
+        }
+    }
     if (cfg_veh_on) {                                        /* on a vehicle (player order, or 0.7.1: the dll's own): stay on it, infantry only when much closer */
         const uint8_t *et = order_target(ent, 1);
         if (et && is_vehicle(et) && et != tgt && (veh || d > dist3(ent, et) * cfg_switch)) return;
@@ -965,13 +1047,32 @@ static void charge_note(const uint8_t *ctx, int inhand, int stance)
         const uint8_t *xt = explicit_target(ent);
         if (xt && xt != tgt) return;                         /* the player sent it at another enemy: his order stands */
         last_t *fl = last_of(ent, 0);
+        if (fl && fl->pl && fl->has_ref) {                   /* 0.7.39: ... also once the dll's own run / melee order replaced it */
+            const void *pc = ref_ent(fl->tref);
+            if (pc && pc != (const void *)tgt) return;
+        }
         if (fl && fl->ms && fl->tgt == tgt && (uint32_t)(now - fl->ms) < cfg_fight_cd) return;   /* just ordered (or drawing) */
         st_fight_q++;
         goto queue;                                          /* flush: draw first if not in hand, else eFight (d < CloseDistance) */
     }
+    {   /* 0.7.39 (Alex, Nov 15 2026: "in melee stance they aren't attacking stuff when I order it"): beyond fight range the
+         * charge went to whatever enemy the scan chose and its order replaced the player's attack order. His order on
+         * another enemy now stands at every range, as it did inside fight range since 0.7.16. */
+        const uint8_t *xt = explicit_target(ent);
+        if (xt && xt != tgt) {
+            st_explicit++;
+            if (cfg_log && g_xlines < 60) { g_xlines++; logf_("charge: [%u ms] unit %p has an attack order on %p: no charge at %p at %.0f (kept %u)", now, (void *)ent, (const void *)xt, (void *)tgt, d, st_explicit); }
+            return;
+        }
+    }
     float reach = g_range((void *)ammo);
     if (d <= reach * 1.1f + 1.0f || d < cfg_charge_min) return;   /* in reach / already fighting: the engine attacks on its own */
-    if (cfg_charge_max > 0 && d > cfg_charge_max) return;
+    if (!ptgt) {                                              /* his own target has no distance limit */
+        if (cfg_charge_max > 0 && d > cfg_charge_max) return;
+        /* 0.7.40 (Alex: stance units "randomly get move orders to the absolute corner of the map and refuse to fight people
+         * nearby"; 0.7.39 log: 13 of 43 run orders of his squad went to enemies 800-1771 units = 40-90 m away) */
+        if (cfg_charge_pmax > 0 && d > cfg_charge_pmax && player_owned(ent)) return;
+    }
     last_t *l = last_of(ent, 0);
     if (l && l->ms) {
         /* one order per enemy: a new AddOrder restarts the running attack order (the unit stops and re-paths), so while
@@ -1014,6 +1115,7 @@ static void charge_note(const uint8_t *ctx, int inhand, int stance)
                     l->stalls = 0; stalled = 1;
                 }
             } else if (cur) {
+                if (l->pl) return;                                          /* 0.7.39: on the enemy the player ordered: no switch while it lives */
                 int cveh = is_vehicle(cur);
                 if (veh && !cveh) return;                                   /* never leave infantry for a vehicle */
                 if (d > dist3(ent, cur) * cfg_switch) return;               /* current enemy still there and not much farther (0.7.1: vehicles too; "gives way at once" sent units off) */
@@ -1021,7 +1123,13 @@ static void charge_note(const uint8_t *ctx, int inhand, int stance)
         }
     }
 queue:;
+    {   /* 0.7.39: is this the enemy the player ordered (his order is still in front, or the dll already took it over)? */
+        const uint8_t *xq = explicit_target(ent);
+        last_t *lq = last_of(ent, 0);
+        g_pend_pl = (xq && xq == tgt) || (lq && lq->pl && lq->has_ref && ref_ent(lq->tref) == (void *)tgt);
+    }
     pend_push(ent, tgt, d, veh, stalled, now);
+    g_pend_pl = 0;
 }
 
 /* ---------------------------------------------------------------- auto-draw queue */
@@ -2079,6 +2187,7 @@ static void log_epoch(uint32_t now)
 {
     if (g_epoch_last && now + 5000 < g_epoch_last) {
         mission_flush();
+        g_pclines = g_xlines = g_vfreelines = g_ghostlines = 0;                    /* 0.7.39 */
         g_lines = g_clines = g_hlines = g_vlines = g_vreflines = g_adjlines = g_adlines = g_rclines = g_dlines = g_mlines = g_mdiag = g_seenlines = g_addiag = g_plines = g_skiplines = g_olines = g_rawlines = g_polllines = g_ovtlines = g_rblines = g_reflines = 0;
         if (cfg_log) logf_("--- clock %u -> %u: new mission, log line caps reset, unit tables cleared (%u weak refs released, %u of them stale so far)", g_epoch_last, now, st_flush_refs, st_ref_stale);
     }
@@ -2811,6 +2920,8 @@ static void load_ini(const char *ini)
     }
     GetPrivateProfileStringA("Charge", "MaxDistance", "2000", buf, sizeof buf, ini);
     cfg_charge_max = (float)atof(buf);
+    GetPrivateProfileStringA("Charge", "PlayerMaxDistance", "1000", buf, sizeof buf, ini);
+    cfg_charge_pmax = (float)atof(buf);
     GetPrivateProfileStringA("Charge", "MinDistance", "60", buf, sizeof buf, ini);
     cfg_charge_min = (float)atof(buf);
     cfg_multi = GetPrivateProfileIntA("MultiSelect", "Enabled", 1, ini);
@@ -3231,7 +3342,7 @@ int main(int argc, char **argv)
     }
     /* charge path on a fake engine (charge_note / charge_flush directly; the return-address gate is the finder's job) */
     {
-        cfg_charge = 1;
+        cfg_charge = 1; cfg_ghost = 0;
         g_tagctor = g_tagdtor = g_refinit = g_refdtor = (vfn1_t)f_nop; g_setent = (setent_t)f_setent;
         g_mkatk = (mkatk_t)f_mkatk; g_addorder = (addord_t)f_add; g_range = (range_t)f_range;
         g_clock = &f_clock; g_ordstamp = &f_stamp; g_refvt = (void *)0x55;
@@ -3302,6 +3413,21 @@ int main(int argc, char **argv)
         printf("charge: queue %d/%d flush %d/%d/%d cooldown %d reach %d ranged %d stance %d always %d far %d close %d 95m %d -> %s\n",
                q0, q1, o0, o1, o2, q2, q3, q4, q5, al, q6, q7, q8, ok ? "OK" : "FAIL");
         if (!ok) fails++;
+        {   /* 0.7.41: an enemy recorded 100 away whose entity sits 5000 away is not charged */
+            cfg_ghost = 1; f_clock += 60000;
+            *(void **)ctx = sword.obj; *(void **)(ctx + 8) = sm_inst.obj; *(void **)(ctx + 0x10) = ti;
+            *(void **)(ti + 0x18) = enemy.obj; *(float *)(ti + 0x28) = 100.0f;
+            *(float *)(enemy.obj + 0x74) = 5000.0f;
+            uint32_t g0 = st_ghost, c0 = st_charge_q;
+            charge_note(ctx, 1, 0);
+            int gh1 = st_ghost == g0 + 1 && st_charge_q == c0;
+            *(float *)(enemy.obj + 0x74) = 100.0f;                 /* where the record has it: charged */
+            charge_note(ctx, 1, 0);
+            int gh2 = st_ghost == g0 + 1;
+            *(float *)(enemy.obj + 0x74) = 0.0f; cfg_ghost = 0;
+            printf("0.7.41: parked entity not charged %d, entity at its recorded place passes %d -> %s\n", gh1, gh2, gh1 && gh2 ? "OK" : "FAIL");
+            if (!(gh1 && gh2)) fails++;
+        }
     }
     /* shield melee ray: [shield linked to target, target] passes; [wall, target] blocks; [target] passes; tagged item passes */
     {
@@ -3337,7 +3463,10 @@ int main(int argc, char **argv)
         *(void **)(tf + 0x18) = foe.obj; *(float *)(tf + 0x28) = 300.0f;                /* 0.7.8: within InfantryRange 400 */
         *(void **)cf = hvy.obj; *(void **)(cf + 8) = st.obj; *(void **)(cf + 0x10) = tf;
         scan_note(cf);                                                                 /* enemy infantry at 300 */
-        int v3 = ms_decide(cv) == REJECT;                                              /* infantry first */
+        int v3a = ms_decide(cv) == MELEE;                                              /* 0.7.39: infantry seen, no charge on it: the vehicle is taken */
+        last_order(last_of(st.obj, 1), foe.obj, 300.0f, f_clock);                      /* a charge on that infantry */
+        int v3 = v3a && ms_decide(cv) == REJECT;                                       /* infantry first */
+        printf("0.7.39: infantry seen without a charge -> vehicle %d, with a charge -> refused %d\n", v3a, v3);
         /* explicit order on the vehicle at the front of the brain queue */
         g_vt_attack = (void **)0x7777;
         *(void **)order = (void *)0x7777; *(uint32_t *)(order + 0x48) = 1; *(void **)(order + 0x58) = veh.obj;
